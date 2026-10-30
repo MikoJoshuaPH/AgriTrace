@@ -51,6 +51,7 @@ class ApiController extends Controller {
             $name = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '')) ?: $user['username'];
             $mailer->send($user['email'], 'Your AgriTrace sign-in code', $mailer->otp_email($name, $code));
         } catch (RuntimeException $e) {
+            error_log('AgriTrace sign-in email failed: ' . $e->getMessage());
             $this->api->respond_error('The sign-in code could not be sent. Please try again in a moment.', 503);
         }
         $this->call->model('Platform_model')->audit((int) $user['id'], 'LOGIN_CODE_SENT', 'Auth', $user['id'], 'Two-factor code emailed');
