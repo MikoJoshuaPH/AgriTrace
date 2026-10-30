@@ -4,6 +4,8 @@ defined('PREVENT_DIRECT_ACCESS') OR exit('No direct script access allowed');
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception as MailException;
 
+require_once __DIR__ . '/Http_client.php';
+
 /**
  * SMTP email through PHPMailer (Gmail by default: smtp.gmail.com:587 with STARTTLS).
  * Load with $this->call->library('Mailer').
@@ -12,7 +14,8 @@ class Mailer
 {
     public function is_configured()
     {
-        return config_item('mail_username') !== '' && config_item('mail_password') !== '';
+        return $this->uses_resend()
+            || (config_item('mail_username') !== '' && config_item('mail_password') !== '');
     }
 
     /**
@@ -24,6 +27,10 @@ class Mailer
     {
         if (!$this->is_configured()) {
             throw new RuntimeException('Email is not configured. Set MAIL_USERNAME and MAIL_PASSWORD in .env.');
+        }
+        if ($this->uses_resend()) {
+            $this->send_with_resend($to, $subject, $html, $text, $attachments, $replyTo);
+            return true;
         }
 
         $mail = new PHPMailer(true);
@@ -67,6 +74,52 @@ class Mailer
             return true;
         } catch (MailException $e) {
             throw new RuntimeException('The email could not be sent: ' . $mail->ErrorInfo);
+        }
+    }
+
+    private function uses_resend()
+    {
+        return config_item('resend_api_key') !== '' && config_item('resend_from') !== '';
+    }
+
+    private function send_with_resend($to, $subject, $html, $text, array $attachments = [], $replyTo = null)
+    {
+        $payload = [
+            'from' => config_item('resend_from'),
+            'to' => array_values((array) $to),
+            'subject' => $subject,
+            'html' => $html,
+            'text' => $text !== '' ? $text : strip_tags($html),
+        ];
+        if (is_string($replyTo) && filter_var($replyTo, FILTER_VALIDATE_EMAIL)) {
+            $payload['reply_to'] = [$replyTo];
+        }
+        if ($attachments) {
+            $payload['attachments'] = array_map(static function (array $file) {
+                return [
+                    'filename' => $file['name'],
+                    'content' => base64_encode($file['content']),
+                ];
+            }, $attachments);
+        }
+
+        $http = new Http_client();
+        $response = $http->request(
+            'POST',
+            'https://api.resend.com/emails',
+            [
+                'Authorization' => 'Bearer ' . config_item('resend_api_key'),
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json',
+            ],
+            json_encode($payload, JSON_THROW_ON_ERROR),
+            20
+        );
+        $data = json_decode($response['body'], true);
+        if ($response['status'] < 200 || $response['status'] >= 300) {
+            $message = is_array($data) ? ($data['message'] ?? $data['name'] ?? '') : '';
+            throw new RuntimeException('Resend rejected the email request'
+                . ($message !== '' ? ': ' . $message : ' (HTTP ' . $response['status'] . ').'));
         }
     }
 
