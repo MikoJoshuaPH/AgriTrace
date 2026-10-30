@@ -418,6 +418,7 @@ $config['app_frontend_url']    = getenv('APP_FRONTEND_URL') ?: 'http://localhost
 
 $config['mail_host']           = getenv('MAIL_HOST') ?: 'smtp.gmail.com';
 $config['mail_port']           = (int) (getenv('MAIL_PORT') ?: 587);
+$config['mail_encryption']     = strtolower((string) (getenv('MAIL_ENCRYPTION') ?: 'tls'));
 $config['mail_username']       = getenv('MAIL_USERNAME') ?: '';
 $config['mail_password']       = getenv('MAIL_PASSWORD') ?: '';
 $config['mail_from']           = getenv('MAIL_FROM') ?: (getenv('MAIL_USERNAME') ?: '');

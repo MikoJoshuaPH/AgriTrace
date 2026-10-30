@@ -34,7 +34,14 @@ class Mailer
             $mail->SMTPAuth   = true;
             $mail->Username   = config_item('mail_username');
             $mail->Password   = config_item('mail_password');
-            $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+            $encryption = strtolower((string) config_item('mail_encryption'));
+            if ($encryption === 'ssl' || $encryption === 'smtps' || $mail->Port === 465) {
+                $mail->SMTPSecure = PHPMailer::ENCRYPTION_SMTPS;
+            } elseif ($encryption === 'tls' || $encryption === 'starttls' || $mail->Port === 587) {
+                $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+            } else {
+                throw new RuntimeException('Unsupported MAIL_ENCRYPTION value. Use tls or ssl.');
+            }
             $mail->CharSet    = 'UTF-8';
             $mail->Timeout    = 15;
             // Certificate checks stay on. MAIL_VERIFY_PEER=false is only for a local test relay with a self-signed certificate.
