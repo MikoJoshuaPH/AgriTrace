@@ -365,6 +365,7 @@ $config['csrf_regenerate']         = FALSE;
 |   ];
 |
 */
+$frontend_origin = rtrim((string) (getenv('APP_FRONTEND_URL') ?: 'http://localhost:5173'), '/');
 $config['security_headers'] = [
     // ── CSP ──
     'csp_enabled' => false,
@@ -399,7 +400,7 @@ $config['security_headers'] = [
     // ── API ──
     'api_max_body' => 1048576,
     'cors' => [
-        'allowed_origins' => ['https://api-tester.marasigan.dev'],
+        'allowed_origins' => [$frontend_origin],
         'credentials'     => TRUE,
         'methods'         => 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
         'headers'         => 'Authorization, Content-Type, X-Requested-With',
