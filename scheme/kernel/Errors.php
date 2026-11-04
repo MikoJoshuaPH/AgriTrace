@@ -88,6 +88,16 @@ class Errors
 	 */
 	public function show_exception($exception)
 	{
+		if (strpos($_SERVER['REQUEST_URI'] ?? '', '/api/') === 0) {
+			http_response_code(500);
+			header('Content-Type: application/json; charset=utf-8');
+			$message = config_item('environment') === 'development'
+				? $exception->getMessage()
+				: 'The server could not complete the request.';
+			echo json_encode(['error' => $message, 'status' => 500]);
+			exit();
+		}
+
 		$template_path = config_item('error_view_path');
 		if (empty($template_path))
 		{

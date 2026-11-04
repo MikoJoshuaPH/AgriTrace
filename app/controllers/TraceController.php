@@ -36,10 +36,14 @@ class TraceController extends Controller
         $buyer = $t['buyer_first']
             ? trim($t['buyer_first'] . ' ' . ($initial !== '' ? $initial . '.' : ''))
             : $t['buyer_username'];
+        $history = !empty($t['batch_id'])
+            ? $this->payments->batch_history_by_id((int) $t['batch_id'])
+            : null;
 
         $this->api->respond([
             'trace_code' => $t['trace_code'],
             'verified' => $t['payment_status'] === 'paid',
+            'provenance_verified' => $history ? $history['provenance_verified'] : false,
             'product' => [
                 'name' => $t['product_name'],
                 'category' => $t['category'],
@@ -48,19 +52,52 @@ class TraceController extends Controller
                 'unit_price' => (float) $t['unit_price'],
             ],
             'farmer' => [
-                'name' => $farmer,
-                'location' => $t['farmer_location'] ?: $t['farmer_address'] ?: $t['listing_location'],
-                'latitude' => $t['farmer_lat'] !== null ? (float) $t['farmer_lat'] : null,
-                'longitude' => $t['farmer_lng'] !== null ? (float) $t['farmer_lng'] : null,
+                'name' => $history ? $history['farmer']['name'] : $farmer,
+                'location' => $history ? $history['farmer']['location'] : ($t['farmer_location'] ?: $t['listing_location']),
             ],
             'buyer' => ['name' => $buyer],
+            'batch' => $history ? $history['batch'] : null,
+            'harvest' => $history ? $history['harvest'] : [],
+            'supply_chain' => $history ? $history['supply_chain'] : [],
             'order' => [
                 'order_id' => (int) $t['order_id'],
                 'ordered_at' => $t['created_at'],
                 'paid_at' => $t['paid_at'],
             ],
-            'qr_url' => $t['qr_url'],
+            'qr_url' => $history && $history['qr_url'] ? $history['qr_url'] : $t['qr_url'],
         ]);
+    }
+
+    /** GET /api/trace/batch/{batch_code} — public batch trace and timeline. */
+    public function show_batch($batchCode)
+    {
+        $this->api->require_method('GET');
+        if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,49}$/', (string) $batchCode)) {
+            $this->api->respond_error('Batch not found.', 404);
+        }
+        $history = $this->payments->batch_history((string) $batchCode);
+        if (!$history) {
+            $this->api->respond_error('Batch not found.', 404);
+        }
+        $this->api->respond($this->batch_response($history, false));
+    }
+
+    /** GET /api/trace/batch/{batch_code}/authorized — supply-chain partner detail. */
+    public function show_batch_authorized($batchCode)
+    {
+        $this->api->require_method('GET');
+        $auth = $this->api->require_jwt();
+        if (!in_array($auth['role'] ?? '', ['admin', 'farmer', 'collector', 'transporter', 'seller'], true)) {
+            $this->api->respond_error('Supply-chain partner access is required.', 403);
+        }
+        if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,49}$/', (string) $batchCode)) {
+            $this->api->respond_error('Batch not found.', 404);
+        }
+        $history = $this->payments->batch_history((string) $batchCode, true);
+        if (!$history) {
+            $this->api->respond_error('Batch not found.', 404);
+        }
+        $this->api->respond($this->batch_response($history, true));
     }
 
     /** GET /api/admin/traces — every trace code with the buyer and farmer accounts. */
@@ -87,7 +124,9 @@ class TraceController extends Controller
         $qr = $this->call->library('QrCoder');
         $cloud = $this->call->library('Cloud_storage');
         try {
-            $png = $qr->png(config_item('app_public_url') . '/trace.html?code=' . $code);
+            $traceUrl = rtrim((string) config_item('app_frontend_url'), '/')
+                . '/trace?code=' . rawurlencode($code);
+            $png = $qr->png($traceUrl);
             $stored = $cloud->put('qr/' . $code . '.png', $png, 'image/png');
         } catch (RuntimeException $e) {
             $this->api->respond_error('The QR code could not be generated: ' . $e->getMessage(), 502);
@@ -98,6 +137,25 @@ class TraceController extends Controller
     }
 
     private $admin_id = 0;
+
+    private function batch_response(array $history, $authorized)
+    {
+        $response = [
+            'trace_code' => $history['trace_code'],
+            'verified' => $history['payment_status'] === 'paid',
+            'provenance_verified' => $history['provenance_verified'],
+            'product' => $history['product'],
+            'farmer' => $history['farmer'],
+            'batch' => $history['batch'],
+            'harvest' => $history['harvest'],
+            'supply_chain' => $history['supply_chain'],
+            'qr_url' => $history['qr_url'],
+        ];
+        if ($authorized) {
+            $response['authorized'] = true;
+        }
+        return $response;
+    }
 
     private function require_admin()
     {

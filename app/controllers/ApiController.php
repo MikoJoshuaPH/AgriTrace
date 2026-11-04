@@ -36,7 +36,7 @@ class ApiController extends Controller {
             $this->api->respond_error('Invalid username or password.', 401);
         }
         if ((int) $user['is_active'] !== 1) {
-            $this->api->respond_error('Your account is waiting for admin approval.', 403);
+            $this->api->respond_error('This account is inactive. Please contact the administrator.', 403);
         }
 
         // Two-factor sign-in: the password is only the first step. A one-time code is emailed,
@@ -251,7 +251,6 @@ class ApiController extends Controller {
             $this->api->respond_error('This username is already in use. Please try again.', 422);
         }
 
-        // Public registrations are inactive until an administrator approves them.
         $new_id = $model->createUser([
             'username' => $username,
             'first_name' => $first_name,
@@ -264,12 +263,12 @@ class ApiController extends Controller {
             'age' => $age,
             'gender' => $gender,
             'contact_number' => $contact,
-            'is_active' => 0
+            'is_active' => 1
         ]);
         $this->call->model('Platform_model')->audit((int) $new_id, 'CREATE_ACCOUNT', 'User', $new_id, 'Self-registration');
 
         $this->api->respond([
-            'message' => 'Registration received. You can sign in after an administrator approves your account.',
+            'message' => 'Your account has been created. You can sign in now.',
             'user_id' => (int) $new_id
         ], 201);
     }
@@ -283,9 +282,10 @@ class ApiController extends Controller {
             $this->api->respond_error('Unauthorized access.', 403);
         }
 
-        $users = $this->db->raw(
-            'SELECT id, username, email, role, created_at FROM users ORDER BY id'
-        )->fetchAll(PDO::FETCH_ASSOC);
+        $users = $this->db->table('users')
+            ->select('id, username, email, role, created_at')
+            ->order_by('id')
+            ->get_all(PDO::FETCH_ASSOC);
 
         $this->api->respond(['data' => $users]);
     }
@@ -303,7 +303,20 @@ class ApiController extends Controller {
             $this->api->respond_error('User not found.', 404);
         }
 
+        if (($user['role'] ?? '') === 'farmer') {
+            $user['farms'] = $this->publicFarms((int) $user['id']);
+            $user['products'] = $this->call->model('Community_model')->listings_by_seller((int) $user['id']);
+        }
         $this->api->respond($user);
+    }
+
+    private function publicFarms($farmerId)
+    {
+        return $this->db->raw(
+            'SELECT farm_id, farm_name, farm_description, municipality, province, latitude, longitude, farm_size, farm_size_unit
+             FROM farms WHERE farmer_id = ? ORDER BY farm_id DESC',
+            [$farmerId]
+        )->fetchAll(PDO::FETCH_ASSOC);
     }
 
     public function update($id)
@@ -428,10 +441,11 @@ class ApiController extends Controller {
             $this->api->respond_error('Invalid user ID.', 422);
         }
 
-        $user = $this->db->raw(
-            'SELECT id FROM users WHERE id = ? LIMIT 1',
-            [$id]
-        )->fetch(PDO::FETCH_ASSOC);
+        $user = $this->db->table('users')
+            ->select('id')
+            ->where('id', $id)
+            ->limit(1)
+            ->get(PDO::FETCH_ASSOC);
 
         if (!$user) {
             $this->api->respond_error('User not found.', 404);
@@ -442,8 +456,8 @@ class ApiController extends Controller {
             $this->api->respond_error('Unauthorized access.', 403);
         }
 
-        $this->db->raw('DELETE FROM refresh_tokens WHERE user_id = ?', [$id]);
-        $this->db->raw('DELETE FROM users WHERE id = ?', [$id]);
+        $this->db->table('refresh_tokens')->where('user_id', $id)->delete();
+        $this->db->table('users')->where('id', $id)->delete();
         $this->call->model('Platform_model')->audit((int) $auth['sub'], 'DELETE_ACCOUNT', 'User', $id, null);
 
         $this->api->respond(['message' => 'User deleted successfully.']);

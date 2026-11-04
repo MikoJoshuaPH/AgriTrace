@@ -64,8 +64,10 @@ $router->group(['prefix' => '/api'], function ($router) {
     $router->get('/list', 'ApiController::list');
     $router->get('/profile', 'ApiController::profile');
     $router->get('/admin/database', 'AdminDatabaseController::index');
+    $router->get('/search', 'CommunityController::search');
     $router->get('/marketplace', 'CommunityController::listings');
     $router->post('/marketplace', 'CommunityController::storeListing');
+    $router->put('/marketplace/{id}', 'CommunityController::updateListing');
     $router->get('/marketplace/{id}/reviews', 'CommunityController::reviews');
     $router->post('/marketplace/{id}/reviews', 'CommunityController::create_review');
     $router->post('/marketplace/{id}/reviews/{reviewId}/comments', 'CommunityController::create_review_comment');
@@ -73,6 +75,7 @@ $router->group(['prefix' => '/api'], function ($router) {
     $router->post('/support/complaints', 'SupportController::create_complaint');
     $router->get('/posts', 'CommunityController::posts');
     $router->post('/posts', 'CommunityController::storePost');
+    $router->post('/posts/{id}/reports', 'CommunityController::report_post');
     $router->post('/media', 'CommunityController::uploadMedia');
     $router->post('/refresh', 'ApiController::refresh');
     // Community, commerce, social and admin features (specific routes must precede the generic resource routes)
@@ -81,7 +84,10 @@ $router->group(['prefix' => '/api'], function ($router) {
     $router->put('/posts/{id}', 'SocialController::update_post');
     $router->delete('/posts/{id}', 'SocialController::delete_post');
     $router->get('/orders', 'CommerceController::index');
+    $router->get('/orders/{id}/batch-options', 'FulfillmentController::batch_options');
     $router->get('/orders/{id}/payment-status', 'CommerceController::payment_status');
+    $router->post('/orders/{id}/payment', 'CommerceController::start_payment');
+    $router->post('/orders/{id}/collect-payment', 'FulfillmentController::collect_payment');
     $router->post('/orders', 'CommerceController::store');
     $router->get('/analytics', 'SocialController::analytics');
     $router->get('/farmers', 'SocialController::farmers');
@@ -97,11 +103,20 @@ $router->group(['prefix' => '/api'], function ($router) {
     $router->get('/messages/users', 'SocialController::message_users');
     $router->get('/messages/{id}', 'SocialController::conversation');
     $router->post('/messages', 'SocialController::send_message');
+    $router->get('/farmer-applications/mine', 'FarmerApplicationController::mine');
+    $router->post('/farmer-applications', 'FarmerApplicationController::store');
+    $router->get('/admin/farmer-applications', 'FarmerApplicationController::admin_index');
+    $router->put('/admin/farmer-applications/{id}', 'FarmerApplicationController::review');
+    $router->get('/catalog/search', 'CatalogController::search');
+    $router->post('/catalog/{id}/aliases', 'CatalogController::alias');
+    $router->get('/farmer/payment-settings', 'PaymentSettingsController::index');
+    $router->post('/farmer/payment-settings', 'PaymentSettingsController::store');
+    $router->get('/farmer/payouts', 'PaymentSettingsController::payouts');
+    $router->post('/orders/{id}/allocate-batches', 'FulfillmentController::allocate');
+    $router->put('/orders/{id}/status', 'FulfillmentController::status');
     $router->get('/admin/queues', 'AdminController::queues');
     $router->post('/admin/users', 'AdminController::create_user');
-    $router->put('/admin/users/{id}/approve', 'AdminController::approve_user');
     $router->put('/admin/users/{id}/verify', 'AdminController::verify_user');
-    $router->put('/admin/posts/{id}/approve', 'AdminController::approve_post');
     $router->put('/admin/reports/{id}/resolve', 'AdminController::resolve_report');
     $router->put('/admin/complaints/{id}/resolve', 'AdminController::resolve_complaint');
 
@@ -112,7 +127,10 @@ $router->group(['prefix' => '/api'], function ($router) {
 
     // Payments, trace codes and QR codes
     $router->post('/payments/xendit/webhook', 'CommerceController::xendit_webhook');
+    $router->get('/trace/batch/{batch_code}/authorized', 'TraceController::show_batch_authorized');
+    $router->get('/trace/batch/{batch_code}', 'TraceController::show_batch');
     $router->get('/trace/{code}', 'TraceController::show');
+    $router->get('/farmer/traceability', 'AgriTraceController::farmer_traceability');
     $router->get('/admin/traces', 'TraceController::admin_index');
     $router->post('/admin/traces/{code}/qr', 'TraceController::regenerate_qr');
 
@@ -122,8 +140,11 @@ $router->group(['prefix' => '/api'], function ($router) {
     $router->get('/admin/cloud/files', 'CloudController::files');
     $router->post('/admin/cloud/upload', 'CloudController::upload');
     $router->delete('/admin/cloud/files', 'CloudController::delete_file');
+    $router->get('/admin/cloud/download', 'CloudController::admin_file_download_url');
     $router->get('/admin/backups', 'CloudController::backups');
+    $router->get('/admin/backups/download', 'CloudController::backup_download_url');
     $router->post('/admin/backups', 'CloudController::create_backup');
+    $router->get('/admin/backups/scheduled', 'CloudController::scheduled_backup');
 
     $router->get('/{resource}', 'AgriTraceController::index');
     $router->post('/{resource}', 'AgriTraceController::store');

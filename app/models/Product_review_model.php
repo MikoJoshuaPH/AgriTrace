@@ -15,16 +15,17 @@ class Product_review_model extends Model
              LIMIT 100',
             [$listingId]
         )->fetchAll(PDO::FETCH_ASSOC);
-        $summary = $this->db->raw(
-            'SELECT COUNT(*) AS review_count, COALESCE(AVG(rating), 0) AS average_rating
-             FROM product_reviews WHERE listing_id = ?',
-            [$listingId]
-        )->fetch(PDO::FETCH_ASSOC);
-        $ownReview = $this->db->raw(
-            'SELECT review_id, rating, review
-             FROM product_reviews WHERE listing_id = ? AND user_id = ? LIMIT 1',
-            [$listingId, $userId]
-        )->fetch(PDO::FETCH_ASSOC);
+        $summary = $this->db->table('product_reviews')
+            ->select_count('review_id', 'review_count')
+            ->select_avg('rating', 'average_rating')
+            ->where('listing_id', $listingId)
+            ->get(PDO::FETCH_ASSOC);
+        $ownReview = $this->db->table('product_reviews')
+            ->select('review_id, rating, review')
+            ->where('listing_id', $listingId)
+            ->where('user_id', $userId)
+            ->limit(1)
+            ->get(PDO::FETCH_ASSOC);
         $purchase = $this->eligible_order_item($listingId, $userId);
         $comments = $this->comments_for_listing($listingId);
         foreach ($reviews as &$review) {
@@ -65,19 +66,23 @@ class Product_review_model extends Model
                  rating = VALUES(rating), review = VALUES(review), updated_at = CURRENT_TIMESTAMP',
             [$listingId, $userId, $orderItemId, $rating, $review]
         );
-        $saved = $this->db->raw(
-            'SELECT review_id FROM product_reviews WHERE listing_id = ? AND user_id = ? LIMIT 1',
-            [$listingId, $userId]
-        )->fetch(PDO::FETCH_ASSOC);
+        $saved = $this->db->table('product_reviews')
+            ->select('review_id')
+            ->where('listing_id', $listingId)
+            ->where('user_id', $userId)
+            ->limit(1)
+            ->get(PDO::FETCH_ASSOC);
         return (int) $saved['review_id'];
     }
 
     public function review_exists($listingId, $reviewId)
     {
-        return (bool) $this->db->raw(
-            'SELECT review_id FROM product_reviews WHERE listing_id = ? AND review_id = ? LIMIT 1',
-            [$listingId, $reviewId]
-        )->fetch(PDO::FETCH_ASSOC);
+        return (bool) $this->db->table('product_reviews')
+            ->select('review_id')
+            ->where('listing_id', $listingId)
+            ->where('review_id', $reviewId)
+            ->limit(1)
+            ->get(PDO::FETCH_ASSOC);
     }
 
     public function add_comment($reviewId, $userId, $comment)
@@ -91,17 +96,14 @@ class Product_review_model extends Model
 
     private function comments_for_listing($listingId)
     {
-        $rows = $this->db->raw(
-            'SELECT c.review_id, c.comment_id, c.body AS comment, c.created_at,
-                    u.username, u.first_name, u.last_name
-             FROM product_review_comments c
-             INNER JOIN product_reviews r ON r.review_id = c.review_id
-             INNER JOIN users u ON u.id = c.user_id
-             WHERE r.listing_id = ?
-             ORDER BY c.comment_id ASC
-             LIMIT 500',
-            [$listingId]
-        )->fetchAll(PDO::FETCH_ASSOC);
+        $rows = $this->db->table('product_review_comments')
+            ->select('product_review_comments.review_id, product_review_comments.comment_id, product_review_comments.body AS comment, product_review_comments.created_at, users.username, users.first_name, users.last_name')
+            ->inner_join('product_reviews', 'product_reviews.review_id = product_review_comments.review_id')
+            ->inner_join('users', 'users.id = product_review_comments.user_id')
+            ->where('product_reviews.listing_id', $listingId)
+            ->order_by('product_review_comments.comment_id', 'ASC')
+            ->limit(500)
+            ->get_all(PDO::FETCH_ASSOC);
         $comments = [];
         foreach ($rows as $row) {
             $reviewId = (int) $row['review_id'];

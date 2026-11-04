@@ -26,7 +26,7 @@ class Mailer
     public function send($to, $subject, $html, $text = '', array $attachments = [], $replyTo = null)
     {
         if (!$this->is_configured()) {
-            throw new RuntimeException('Email is not configured. Set MAIL_USERNAME and MAIL_PASSWORD in .env.');
+            throw new RuntimeException('Email is not configured. Set the SMTP login and password in .env.');
         }
         if ($this->uses_resend()) {
             $this->send_with_resend($to, $subject, $html, $text, $attachments, $replyTo);

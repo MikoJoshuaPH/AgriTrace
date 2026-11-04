@@ -435,6 +435,5 @@ $config['xendit_callback_token'] = getenv('XENDIT_CALLBACK_TOKEN') ?: '';
 $config['qrcoder_base_url']    = getenv('QRCODER_BASE_URL') ?: 'https://www.qrcoder.co.uk/api/v4/';
 $config['qrcoder_api_key']     = getenv('QRCODER_API_KEY') ?: '';
 
-$config['cloud_bridge_url']    = getenv('CLOUD_BRIDGE_URL') ?: '';
-$config['cloud_bridge_key']    = getenv('CLOUD_BRIDGE_KEY') ?: '';
+$config['upstash_blob_media_token']  = getenv('UPSTASH_BLOB_TOKEN') ?: '';
 ?>

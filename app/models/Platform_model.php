@@ -84,9 +84,15 @@ class Platform_model extends Model
 
     public function farmers($viewerId)
     {
-        $farmers = $this->db->table('users')->select('id, username, first_name, last_name, address, profile_pic, is_verified')
-            ->where(['role' => 'farmer', 'is_active' => 1])->where('id', '<>', $viewerId)
-            ->get_all(PDO::FETCH_ASSOC);
+        $farmers = $this->db->raw(
+            'SELECT id, username, first_name, middle_name, last_name, profile_pic, is_verified,
+                    (SELECT farm_name FROM farms WHERE farms.farmer_id = users.id ORDER BY farm_id DESC LIMIT 1) AS farm_name,
+                    (SELECT municipality FROM farms WHERE farms.farmer_id = users.id ORDER BY farm_id DESC LIMIT 1) AS municipality,
+                    (SELECT province FROM farms WHERE farms.farmer_id = users.id ORDER BY farm_id DESC LIMIT 1) AS province
+             FROM users
+             WHERE role = ? AND is_active = 1 AND id <> ?',
+            ['farmer', $viewerId]
+        )->fetchAll(PDO::FETCH_ASSOC);
         $followerCounts = $this->db->table('user_follows')->select('followee_id')
             ->select_count('followee_id', 'followers')->group_by('followee_id')
             ->get_all(PDO::FETCH_ASSOC);
@@ -295,7 +301,7 @@ class Platform_model extends Model
     public function orders($userId = null)
     {
         $query = $this->db->table('orders')
-            ->select('orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.paid_at, orders.xendit_invoice_url, orders.created_at, u.username AS buyer')
+            ->select('orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.payment_method, orders.paid_at, orders.xendit_invoice_url, orders.delivery_address, orders.requested_delivery_at, orders.shipping_provider, orders.transaction_reference, orders.tracking_number, orders.created_at, u.username AS buyer, u.first_name AS buyer_first, u.last_name AS buyer_last, u.email AS buyer_email, u.address AS buyer_address')
             ->inner_join('users u', 'u.id = orders.buyer_id');
         if ($userId !== null) {
             $query->where('orders.buyer_id', $userId);
@@ -304,10 +310,12 @@ class Platform_model extends Model
         if (!$orderRows) {
             return $orderRows;
         }
+
         $orderIds = array_map('intval', array_column($orderRows, 'order_id'));
         $items = $this->db->table('order_items')
-            ->select('order_items.order_id, order_items.item_id, order_items.listing_id, order_items.seller_id, order_items.product_name, order_items.unit_price, order_items.quantity, order_items.unit, trace_codes.trace_code, trace_codes.qr_url')
+            ->select('order_items.order_id, order_items.item_id, order_items.listing_id, order_items.seller_id, order_items.product_name, order_items.catalog_id, order_items.subtotal, order_items.unit_price, order_items.quantity, order_items.unit, order_items.selling_unit, order_items.batch_unit, order_items.batch_id, order_items.batch_code, order_items.farm_id, order_items.farm_name, order_items.harvest_date, order_items.expiration_date, order_items.cart_added_at, marketplace_listings.image_url, trace_codes.trace_code, trace_codes.qr_url')
             ->left_join('trace_codes', 'trace_codes.order_item_id = order_items.item_id')
+            ->left_join('marketplace_listings', 'marketplace_listings.listing_id = order_items.listing_id')
             ->grouped(function ($db) use ($orderIds) {
                 foreach ($orderIds as $index => $orderId) {
                     $index === 0 ? $db->where('order_items.order_id', $orderId) : $db->or_where('order_items.order_id', $orderId);
@@ -324,7 +332,67 @@ class Platform_model extends Model
             $order['items'] = $itemsByOrder[(int) $order['order_id']] ?? [];
         }
         unset($order);
+        $this->attach_order_history($orderRows);
         return $orderRows;
+    }
+
+    public function orders_for_seller($sellerId)
+    {
+        $rows = $this->db->raw(
+            'SELECT DISTINCT o.order_id, o.buyer_id, o.total_amount, o.status, o.payment_status,
+                    o.payment_method, o.delivery_address, o.requested_delivery_at,
+                    o.shipping_provider, o.transaction_reference, o.tracking_number, o.paid_at, o.created_at,
+                    u.username AS buyer, u.first_name AS buyer_first, u.last_name AS buyer_last,
+                    u.email AS buyer_email, u.address AS buyer_address
+             FROM orders o
+             INNER JOIN users u ON u.id = o.buyer_id
+             INNER JOIN order_items oi ON oi.order_id = o.order_id
+             WHERE oi.seller_id = ?
+             ORDER BY o.order_id DESC LIMIT 200',
+            [(int) $sellerId]
+        )->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($rows as &$order) {
+            $order['items'] = $this->db->raw(
+                'SELECT oi.item_id, oi.listing_id, oi.seller_id, oi.product_name, oi.catalog_id,
+                        oi.unit_price, oi.subtotal, oi.quantity, oi.unit, oi.selling_unit,
+                        oi.batch_unit, oi.batch_id, oi.batch_code, oi.farm_id, oi.farm_name,
+                        oi.harvest_date, oi.expiration_date, oi.cart_added_at,
+                        l.image_url, p.product_name AS catalog_name,
+                        COALESCE((SELECT SUM(ba.quantity) FROM batch_allocations ba
+                                  WHERE ba.order_item_id = oi.item_id), 0) AS allocated_quantity
+                 FROM order_items oi
+                 LEFT JOIN marketplace_listings l ON l.listing_id = oi.listing_id
+                 LEFT JOIN products p ON p.product_id = oi.catalog_id
+                 WHERE oi.order_id = ? AND oi.seller_id = ?
+                 ORDER BY oi.item_id',
+                [(int) $order['order_id'], (int) $sellerId]
+            )->fetchAll(PDO::FETCH_ASSOC);
+        }
+        unset($order);
+        $this->attach_order_history($rows);
+        return $rows;
+    }
+
+    private function attach_order_history(array &$orders)
+    {
+        if (!$orders) {
+            return;
+        }
+        $ids = array_map('intval', array_column($orders, 'order_id'));
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $historyRows = $this->db->raw(
+            "SELECT order_id, status, payment_status, note, created_at
+             FROM order_status_history WHERE order_id IN ({$placeholders}) ORDER BY history_id ASC",
+            $ids
+        )->fetchAll(PDO::FETCH_ASSOC);
+        $byOrder = [];
+        foreach ($historyRows as $history) {
+            $byOrder[(int) $history['order_id']][] = $history;
+        }
+        foreach ($orders as &$order) {
+            $order['history'] = $byOrder[(int) $order['order_id']] ?? [];
+        }
+        unset($order);
     }
 
     public function analytics($userId)
@@ -348,7 +416,6 @@ class Platform_model extends Model
         $ownReviews = ['count' => 0, 'average_rating' => 0.0];
         $topProducts = [];
         if ($ownListingIds) {
-            $placeholders = implode(',', array_fill(0, count($ownListingIds), '?'));
             $ownReviews = $this->db->raw(
                 'SELECT COUNT(*) AS count, COALESCE(AVG(r.rating), 0) AS average_rating
                  FROM product_reviews r
@@ -373,6 +440,57 @@ class Platform_model extends Model
             }
             unset($product);
         }
+        $salesSummary = $this->db->raw(
+            'SELECT COUNT(DISTINCT o.buyer_id) AS buyer_count,
+                    COALESCE(SUM(oi.quantity), 0) AS units_sold,
+                    COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS revenue,
+                    COUNT(DISTINCT o.order_id) AS paid_orders
+             FROM order_items oi
+             INNER JOIN orders o ON o.order_id = oi.order_id
+             WHERE oi.seller_id = ? AND o.payment_status = ?',
+            [(int) $userId, 'paid']
+        )->fetch(PDO::FETCH_ASSOC);
+        $productBuyers = $this->db->raw(
+            "SELECT oi.listing_id, oi.product_name, o.buyer_id,
+                    CONCAT_WS(CHAR(32), b.first_name, b.last_name) AS buyer_name,
+                    b.username AS buyer_username, SUM(oi.quantity) AS quantity,
+                    COUNT(DISTINCT o.order_id) AS order_count,
+                    SUM(oi.quantity * oi.unit_price) AS revenue,
+                    MAX(o.paid_at) AS last_purchase
+             FROM order_items oi
+             INNER JOIN orders o ON o.order_id = oi.order_id
+             INNER JOIN users b ON b.id = o.buyer_id
+             WHERE oi.seller_id = ? AND o.payment_status = ?
+             GROUP BY oi.listing_id, oi.product_name, o.buyer_id, b.first_name, b.last_name, b.username
+             ORDER BY last_purchase DESC, oi.product_name, buyer_name
+             LIMIT 200",
+            [(int) $userId, 'paid']
+        )->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($productBuyers as &$buyer) {
+            $buyer['quantity'] = (float) $buyer['quantity'];
+            $buyer['order_count'] = (int) $buyer['order_count'];
+            $buyer['revenue'] = (float) $buyer['revenue'];
+        }
+        unset($buyer);
+        $monthlySales = $this->db->raw(
+            "SELECT DATE_FORMAT(o.paid_at, '%Y-%m') AS month,
+                    COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS revenue,
+                    COALESCE(SUM(oi.quantity), 0) AS units_sold,
+                    COUNT(DISTINCT o.order_id) AS paid_orders
+             FROM order_items oi
+             INNER JOIN orders o ON o.order_id = oi.order_id
+             WHERE oi.seller_id = ? AND o.payment_status = ?
+               AND o.paid_at >= DATE_SUB(CURDATE(), INTERVAL 11 MONTH)
+             GROUP BY DATE_FORMAT(o.paid_at, '%Y-%m')
+             ORDER BY month",
+            [(int) $userId, 'paid']
+        )->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($monthlySales as &$month) {
+            $month['revenue'] = (float) $month['revenue'];
+            $month['units_sold'] = (float) $month['units_sold'];
+            $month['paid_orders'] = (int) $month['paid_orders'];
+        }
+        unset($month);
         return [
             'active_listings' => (int) $this->db->table('marketplace_listings')->where(['is_available' => 1])->where('stock', '>', 0)->count(),
             'categories' => $categories,
@@ -380,28 +498,71 @@ class Platform_model extends Model
             'groups_joined' => (int) $this->db->table('group_members')->where('user_id', $userId)->count(),
             'my_orders' => (int) $orderCount,
             'my_spend' => (float) ($orderSpend['total_spend'] ?? 0),
-            'my_pending_posts' => (int) $this->db->table('community_posts')->where(['author_id' => $userId, 'status' => 'pending'])->count(),
+            'my_posts' => (int) $this->db->table('community_posts')->where(['author_id' => $userId, 'status' => 'approved'])->count(),
             'my_products' => count($ownProducts),
             'my_product_reviews' => (int) ($ownReviews['count'] ?? 0),
             'my_product_average_rating' => (float) ($ownReviews['average_rating'] ?? 0),
-            'my_top_products' => $topProducts
+            'my_top_products' => $topProducts,
+            'my_buyer_count' => (int) ($salesSummary['buyer_count'] ?? 0),
+            'my_units_sold' => (float) ($salesSummary['units_sold'] ?? 0),
+            'my_sales_revenue' => (float) ($salesSummary['revenue'] ?? 0),
+            'my_paid_orders' => (int) ($salesSummary['paid_orders'] ?? 0),
+            'my_product_buyers' => $productBuyers,
+            'my_monthly_sales' => $monthlySales
         ];
     }
 
-    public function reports($status = 'open')
+    public function reports($status = null)
     {
-        return $this->db->table('reports')
-            ->select('reports.report_id, reports.reason, reports.status, reports.created_at, reports.reported_user_id, reporter.username AS reported_by, target.username AS reported_user')
+        $query = $this->db->table('reports')
+            ->select('reports.report_id, reports.reason, reports.status, reports.created_at, reports.resolved_at, reports.reported_user_id, reports.reporter_id, reports.post_id, reports.post_content_snapshot, reports.post_media_url_snapshot, reports.post_media_type_snapshot, reports.post_product_snapshot, reports.review_action, reporter.username AS reported_by, target.username AS reported_user')
             ->left_join('users reporter', 'reporter.id = reports.reporter_id')
-            ->left_join('users target', 'target.id = reports.reported_user_id')
-            ->where('reports.status', $status)->order_by('reports.report_id', 'DESC')->limit(100)->get_all(PDO::FETCH_ASSOC);
+            ->left_join('users target', 'target.id = reports.reported_user_id');
+        if ($status !== null) {
+            $query->where('reports.status', $status);
+        }
+        return $query->order_by('reports.report_id', 'DESC')->limit(100)->get_all(PDO::FETCH_ASSOC);
     }
 
-    public function resolve_report($reportId)
+    public function report_details($reportId)
     {
-        return $this->db->table('reports')->where('report_id', $reportId)->update([
-            'status' => 'resolved', 'resolved_at' => date('Y-m-d H:i:s')
+        return $this->db->table('reports')
+            ->select('report_id, reporter_id, reported_user_id, post_id, reason, status')
+            ->where('report_id', $reportId)->limit(1)->get(PDO::FETCH_ASSOC);
+    }
+
+    public function create_post_report($reporterId, $reportedUserId, $postId, $reason, array $post)
+    {
+        $product = null;
+        if (!empty($post['listing_id'])) {
+            $product = [
+                'name' => $post['product_name'] ?? null,
+                'category' => $post['category'] ?? null,
+                'description' => $post['product_description'] ?? null,
+                'price' => $post['price'] ?? null,
+                'unit' => $post['unit'] ?? null,
+                'image_url' => $post['product_image'] ?? null,
+            ];
+        }
+        return (int) $this->db->table('reports')->insert([
+            'reporter_id' => $reporterId,
+            'reported_user_id' => $reportedUserId,
+            'post_id' => $postId,
+            'reason' => $reason,
+            'post_content_snapshot' => $post['content'],
+            'post_media_url_snapshot' => $post['media_url'],
+            'post_media_type_snapshot' => $post['media_type'],
+            'post_product_snapshot' => $product === null ? null : json_encode($product, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
         ]);
+    }
+
+    public function resolve_report($reportId, $reviewAction = null)
+    {
+        $updates = ['status' => 'resolved', 'resolved_at' => date('Y-m-d H:i:s')];
+        if ($reviewAction !== null) {
+            $updates['review_action'] = $reviewAction;
+        }
+        return $this->db->table('reports')->where('report_id', $reportId)->update($updates);
     }
 
     public function report_exists($reportId)

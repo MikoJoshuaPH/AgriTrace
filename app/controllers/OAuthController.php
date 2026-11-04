@@ -2,7 +2,7 @@
 defined('PREVENT_DIRECT_ACCESS') OR exit('No direct script access allowed');
 
 /**
- * Google and Facebook OAuth login/registration.
+ * Google OAuth login/registration.
  */
 class OAuthController extends Controller
 {
@@ -19,16 +19,13 @@ class OAuthController extends Controller
 
     public function start($provider)
     {
-        if (!in_array($provider, ['google', 'facebook'], true)) {
+        if ($provider !== 'google') {
             $this->api->respond_error('Unsupported sign-in provider.', 404);
         }
-        $credentials = $this->credentials($provider);
+        $credentials = $this->credentials();
         if (!$credentials['client_id'] || !$credentials['client_secret']) {
-            $variables = $provider === 'google'
-                ? 'GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET'
-                : 'FACEBOOK_APP_ID and FACEBOOK_APP_SECRET';
             $this->redirect_frontend([
-                'social_error' => ucfirst($provider) . ' sign-in is not configured. Set ' . $variables . ' in the backend .env file.'
+                'social_error' => 'Google sign-in is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in the backend .env file.'
             ]);
         }
         $query = $this->api->get_query_params();
@@ -48,31 +45,21 @@ class OAuthController extends Controller
             'created_at' => time()
         ];
         $redirectUri = $this->callback_url($provider);
-        if ($provider === 'google') {
-            $url = 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query([
-                'client_id' => $credentials['client_id'],
-                'redirect_uri' => $redirectUri,
-                'response_type' => 'code',
-                'scope' => 'openid email profile',
-                'state' => $state,
-                'prompt' => 'select_account'
-            ], '', '&', PHP_QUERY_RFC3986);
-        } else {
-            $url = 'https://www.facebook.com/v22.0/dialog/oauth?' . http_build_query([
-                'client_id' => $credentials['client_id'],
-                'redirect_uri' => $redirectUri,
-                'response_type' => 'code',
-                'scope' => 'email,public_profile',
-                'state' => $state
-            ], '', '&', PHP_QUERY_RFC3986);
-        }
+        $url = 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query([
+            'client_id' => $credentials['client_id'],
+            'redirect_uri' => $redirectUri,
+            'response_type' => 'code',
+            'scope' => 'openid email profile',
+            'state' => $state,
+            'prompt' => 'select_account'
+        ], '', '&', PHP_QUERY_RFC3986);
         header('Location: ' . $url, true, 302);
         exit;
     }
 
     public function callback($provider)
     {
-        if (!in_array($provider, ['google', 'facebook'], true)) {
+        if ($provider !== 'google') {
             $this->redirect_frontend(['social_error' => 'Unsupported sign-in provider.']);
         }
         $this->start_session();
@@ -92,9 +79,7 @@ class OAuthController extends Controller
         }
 
         try {
-            $identity = $provider === 'google'
-                ? $this->google_identity($code)
-                : $this->facebook_identity($code);
+            $identity = $this->google_identity($code);
         } catch (RuntimeException $error) {
             $this->redirect_frontend(['social_error' => $error->getMessage()]);
         }
@@ -125,13 +110,13 @@ class OAuthController extends Controller
                 'password' => password_hash(bin2hex(random_bytes(32)), PASSWORD_DEFAULT),
                 'role' => $expected['role'] ?? 'farmer',
                 'profile_pic' => $identity['picture'] ?? null,
-                'is_active' => 0
+                'is_active' => 1
             ]);
             $this->call->model('Platform_model')->audit((int) $newId, 'CREATE_ACCOUNT', 'User', $newId, 'OAuth registration (' . $provider . ')');
-            $this->redirect_frontend(['social_status' => 'pending']);
+            $user = $model->findByEmail($email);
         }
         if ((int) $user['is_active'] !== 1) {
-            $this->redirect_frontend(['social_status' => 'pending']);
+            $this->redirect_frontend(['social_error' => 'This account is inactive. Please contact the administrator.']);
         }
 
         $activeUser = $model->findById((int) $user['id']);
@@ -140,17 +125,11 @@ class OAuthController extends Controller
         $this->redirect_frontend([], $tokens);
     }
 
-    private function credentials($provider)
+    private function credentials()
     {
-        if ($provider === 'google') {
-            return [
-                'client_id' => getenv('GOOGLE_CLIENT_ID') ?: '',
-                'client_secret' => getenv('GOOGLE_CLIENT_SECRET') ?: ''
-            ];
-        }
         return [
-            'client_id' => getenv('FACEBOOK_APP_ID') ?: '',
-            'client_secret' => getenv('FACEBOOK_APP_SECRET') ?: ''
+            'client_id' => getenv('GOOGLE_CLIENT_ID') ?: '',
+            'client_secret' => getenv('GOOGLE_CLIENT_SECRET') ?: ''
         ];
     }
 
@@ -161,7 +140,7 @@ class OAuthController extends Controller
 
     private function google_identity($code)
     {
-        $credentials = $this->credentials('google');
+        $credentials = $this->credentials();
         $response = $this->http->request('POST', 'https://oauth2.googleapis.com/token', [
             'Content-Type' => 'application/x-www-form-urlencoded',
             'Accept' => 'application/json'
@@ -185,31 +164,6 @@ class OAuthController extends Controller
             throw new RuntimeException('Please use a Google account with a verified email address.');
         }
         return $identity;
-    }
-
-    private function facebook_identity($code)
-    {
-        $credentials = $this->credentials('facebook');
-        $tokenUrl = 'https://graph.facebook.com/v22.0/oauth/access_token?' . http_build_query([
-            'client_id' => $credentials['client_id'],
-            'client_secret' => $credentials['client_secret'],
-            'redirect_uri' => $this->callback_url('facebook'),
-            'code' => $code
-        ], '', '&', PHP_QUERY_RFC3986);
-        $token = $this->decode_response($this->http->request('GET', $tokenUrl, ['Accept' => 'application/json']), 'Facebook token exchange failed.');
-        if (empty($token['access_token'])) {
-            throw new RuntimeException('Facebook sign-in could not be completed.');
-        }
-        $profileUrl = 'https://graph.facebook.com/v22.0/me?' . http_build_query([
-            'fields' => 'id,name,email,picture.type(large)',
-            'access_token' => $token['access_token']
-        ], '', '&', PHP_QUERY_RFC3986);
-        $profile = $this->decode_response($this->http->request('GET', $profileUrl, ['Accept' => 'application/json']), 'Could not load your Facebook profile.');
-        return [
-            'email' => $profile['email'] ?? '',
-            'name' => $profile['name'] ?? '',
-            'picture' => $profile['picture']['data']['url'] ?? null
-        ];
     }
 
     private function decode_response(array $response, $message)

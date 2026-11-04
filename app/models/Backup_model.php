@@ -11,7 +11,6 @@ class Backup_model extends Model
     public function dump()
     {
         $out = "-- AgriTrace database backup\n-- Created: " . date('c') . "\n\nSET FOREIGN_KEY_CHECKS=0;\n\n";
-        // SHOW statements are not part of the query builder, so they use the framework's raw query.
         $tables = $this->db->raw('SHOW TABLES')->fetchAll(PDO::FETCH_COLUMN);
         foreach ($tables as $table) {
             $create = $this->db->raw("SHOW CREATE TABLE `{$table}`")->fetch(PDO::FETCH_ASSOC);

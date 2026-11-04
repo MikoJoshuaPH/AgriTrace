@@ -26,6 +26,9 @@ class CommerceController extends Controller
         $query = $this->api->get_query_params();
         $isAdmin = ($auth['role'] ?? '') === 'admin';
         $all = $isAdmin && !empty($query['all']);
+        if (($auth['role'] ?? '') === 'farmer' && !$all) {
+            $this->api->respond(['data' => $this->platform->orders_for_seller((int) $auth['sub'])]);
+        }
         $this->api->respond(['data' => $this->platform->orders($all ? null : (int) $auth['sub'])]);
     }
 
@@ -52,7 +55,7 @@ class CommerceController extends Controller
         $this->api->respond(['sales' => $sales]);
     }
 
-    /** GET /api/orders/{id}/payment-status — reconcile the invoice after returning from Xendit. */
+    /** GET /api/orders/{id}/payment-status — reconciles the invoice with Xendit. */
     public function payment_status($id)
     {
         $this->api->require_method('GET');
@@ -69,7 +72,8 @@ class CommerceController extends Controller
         if (($auth['role'] ?? '') !== 'admin' && (int) $order['buyer_id'] !== (int) $auth['sub']) {
             $this->api->respond_error('Unauthorized access.', 403);
         }
-        if ($order['payment_status'] !== 'unpaid' || empty($order['xendit_invoice_id'])) {
+        if (!in_array($order['payment_status'], ['unpaid', 'awaiting_payment', 'payment_processing'], true)
+            || empty($order['xendit_invoice_id'])) {
             $this->api->respond(['payment_status' => $order['payment_status']]);
         }
 
@@ -88,11 +92,11 @@ class CommerceController extends Controller
                 $this->after_payment((int) $orderId);
             }
             $paymentStatus = 'paid';
-        } elseif ($status === 'EXPIRED') {
+        } elseif (in_array($status, ['EXPIRED', 'FAILED', 'CANCELLED'], true)) {
             if ($this->payments->mark_expired((int) $orderId)) {
-                $this->platform->audit((int) $order['buyer_id'], 'PAYMENT_EXPIRED', 'Order', (int) $orderId, 'Stock released');
+                $this->platform->audit((int) $order['buyer_id'], 'PAYMENT_FAILED', 'Order', (int) $orderId, 'Batch reservation released');
             }
-            $paymentStatus = 'expired';
+            $paymentStatus = 'failed';
         } else {
             $paymentStatus = 'unpaid';
         }
@@ -100,10 +104,51 @@ class CommerceController extends Controller
         $this->api->respond(['payment_status' => $paymentStatus]);
     }
 
+    /** POST /api/orders/{id}/payment — starts online payment after farmer acceptance. */
+    public function start_payment($id)
+    {
+        $this->api->require_method('POST');
+        $auth = $this->api->require_jwt();
+        $orderId = filter_var($id, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        if ($orderId === false) {
+            $this->api->respond_error('Invalid order ID.', 422);
+        }
+        $order = $this->payments->order_with_buyer((int) $orderId);
+        if (!$order || (int) $order['buyer_id'] !== (int) $auth['sub']) {
+            $this->api->respond_error('Order not found.', 404);
+        }
+        if ($order['payment_method'] !== 'xendit' || $order['status'] !== 'awaiting_payment') {
+            $this->api->respond_error('Online payment is available after the farmer accepts the order.', 409);
+        }
+        if (!empty($order['xendit_invoice_url'])) {
+            $this->api->respond(['invoice_url' => $order['xendit_invoice_url']]);
+        }
+
+        $xendit = $this->call->library('Xendit');
+        if (!$xendit->is_configured()) {
+            $this->api->respond_error('Online payment is not configured. Contact the administrator.', 503);
+        }
+        $input = $this->api->body();
+        try {
+            $returnUrl = $this->payment_return_url($input['frontend_origin'] ?? null, (int) $orderId);
+            $invoice = $xendit->create_invoice(
+                $this->invoice_payload($order, $this->payments->order_items((int) $orderId), $returnUrl)
+            );
+        } catch (RuntimeException $e) {
+            $this->platform->audit((int) $auth['sub'], 'PAYMENT_START_FAILED', 'Order', (int) $orderId, $e->getMessage());
+            $this->api->respond_error('Payment could not be started. Your reserved stock remains held while the order awaits payment.', 502);
+        }
+
+        $this->payments->save_invoice((int) $orderId, $invoice['id'], $invoice['invoice_url'], $invoice['external_id']);
+        $this->payments->record_order_event((int) $orderId, 'payment_processing', 'payment_processing', 'Online invoice created.', (int) $auth['sub']);
+        $this->platform->audit((int) $auth['sub'], 'START_ONLINE_PAYMENT', 'Order', (int) $orderId);
+        $this->api->respond(['invoice_url' => $invoice['invoice_url'], 'payment_status' => 'payment_processing']);
+    }
+
     /**
      * POST /api/orders {items: [{listing_id, quantity}]}
-     * Reserves the stock in one transaction, then opens a Xendit invoice for the total.
-     * If the invoice cannot be created the reservation is released.
+     * Reserves batch inventory and creates one reviewable order per farmer.
+     * Online invoices are created only after the farmer accepts an order.
      */
     public function store()
     {
@@ -112,33 +157,69 @@ class CommerceController extends Controller
         $buyer = (int) $auth['sub'];
         $input = $this->api->body();
         $items = $input['items'] ?? null;
-        $returnOrigin = $input['frontend_origin'] ?? null;
-
+        $checkoutKey = trim((string) ($input['idempotency_key'] ?? ''));
+        $deliveryAddress = trim((string) ($input['delivery_address'] ?? ''));
         $xendit = $this->call->library('Xendit');
-        if (!$xendit->is_configured()) {
-            $this->api->respond_error('Online payment is not available right now. Please try again later.', 503);
+        $paymentMethod = strtolower(trim((string) ($input['payment_method'] ?? '')));
+        if (!in_array($paymentMethod, ['cod', 'xendit'], true)) {
+            $this->api->respond_error('Choose Cash on Delivery or Online Payment.', 422);
+        }
+        if ($paymentMethod === 'xendit' && !$xendit->is_configured()) {
+            $this->api->respond_error('Online payment is not configured. Choose Cash on Delivery or contact the administrator.', 503);
         }
         if (!is_array($items) || count($items) === 0 || count($items) > 50) {
             $this->api->respond_error('Your cart is empty.', 422);
+        }
+        if (!preg_match('/^[A-Za-z0-9-]{16,64}$/', $checkoutKey)) {
+            $this->api->respond_error('A valid checkout request key is required. Please retry checkout.', 422);
+        }
+        if ($deliveryAddress === '' || strlen($deliveryAddress) > 1000) {
+            $this->api->respond_error('Enter a delivery address (maximum 1000 characters).', 422);
         }
 
         $lines = [];
         foreach ($items as $item) {
             $listingId = filter_var($item['listing_id'] ?? null, FILTER_VALIDATE_INT);
             $quantity = filter_var($item['quantity'] ?? null, FILTER_VALIDATE_FLOAT);
-            if ($listingId === false || $quantity === false || $quantity <= 0) {
-                $this->api->respond_error('Each cart item needs a listing and a quantity greater than zero.', 422);
+            $batchId = array_key_exists('batch_id', $item)
+                ? filter_var($item['batch_id'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]])
+                : null;
+            if ($listingId === false || $quantity === false || $quantity <= 0
+                || (array_key_exists('batch_id', $item) && $batchId === false)) {
+                $this->api->respond_error('Each cart item needs a valid listing, batch, and quantity greater than zero.', 422);
             }
-            $lines[] = ['listing_id' => $listingId, 'quantity' => $quantity];
+            $addedAt = is_string($item['cart_added_at'] ?? null) ? strtotime($item['cart_added_at']) : false;
+            $lines[] = [
+                'listing_id' => $listingId,
+                'batch_id' => $batchId,
+                'quantity' => $quantity,
+                'cart_added_at' => $addedAt === false ? date('Y-m-d H:i:s') : date('Y-m-d H:i:s', $addedAt)
+            ];
         }
 
         $this->db->transaction();
         try {
-            $total = 0.0;
-            $prepared = [];
+            $this->db->raw('SELECT id FROM users WHERE id = ? FOR UPDATE', [$buyer])->fetch(PDO::FETCH_ASSOC);
+            $existingOrders = $this->db->raw(
+                'SELECT order_id, seller_id, total_amount AS total, payment_method
+                 FROM orders WHERE buyer_id = ? AND checkout_key = ? ORDER BY order_id',
+                [$buyer, $checkoutKey]
+            )->fetchAll(PDO::FETCH_ASSOC);
+            if ($existingOrders) {
+                $this->db->commit();
+                $this->api->respond([
+                    'message' => 'This checkout was already submitted.',
+                    'orders' => $existingOrders,
+                    'payment_status' => 'unpaid',
+                    'payment_method' => $paymentMethod
+                ], 200);
+            }
+            $preparedBySeller = [];
+            $sellerTotals = [];
             foreach ($lines as $line) {
                 $listing = $this->db->raw(
-                    'SELECT listing_id, seller_id, product_name, price, stock, unit, is_available
+                    'SELECT listing_id, seller_id, product_name, category, price, stock, unit, selling_unit,
+                            catalog_id, farm_id, batch_id, is_available
                      FROM marketplace_listings WHERE listing_id = ? FOR UPDATE',
                     [$line['listing_id']]
                 )->fetch(PDO::FETCH_ASSOC);
@@ -149,27 +230,127 @@ class CommerceController extends Controller
                 if ((int) $listing['seller_id'] === $buyer) {
                     throw new RuntimeException('You cannot order your own product.');
                 }
-                if ((float) $listing['stock'] < $line['quantity']) {
-                    throw new RuntimeException('Not enough stock for ' . $listing['product_name'] . '.');
+                if (empty($listing['batch_id']) && empty($line['batch_id'])) {
+                    throw new RuntimeException($listing['product_name'] . ' is not linked to an available harvest batch.');
                 }
-                $total += (float) $listing['price'] * $line['quantity'];
-                $prepared[] = ['listing' => $listing, 'quantity' => $line['quantity']];
+                $selectedBatchId = $line['batch_id'] ?: (int) $listing['batch_id'];
+                $batch = $this->db->raw(
+                    'SELECT pb.batch_id, pb.batch_code, pb.product_id, pb.farm_id, f.farm_name,
+                            pb.quantity, pb.available_quantity,
+                            pb.unit, pb.unit_price, pb.selling_unit, pb.current_status, pb.harvest_date, pb.expiration_date
+                     FROM product_batches pb INNER JOIN farms f ON f.farm_id = pb.farm_id
+                     WHERE pb.batch_id = ? FOR UPDATE',
+                    [$selectedBatchId]
+                )->fetch(PDO::FETCH_ASSOC);
+                $available = $batch && $batch['available_quantity'] !== null
+                    ? (float) $batch['available_quantity']
+                    : (float) ($batch['quantity'] ?? 0);
+                if (!$batch || (int) $batch['farm_id'] !== (int) $listing['farm_id']
+                    || ($listing['catalog_id'] !== null && (int) $batch['product_id'] !== (int) $listing['catalog_id'])) {
+                    throw new RuntimeException($listing['product_name'] . ' no longer matches its harvest batch.');
+                }
+                if (!empty($batch['expiration_date']) && $batch['expiration_date'] < date('Y-m-d')) {
+                    throw new RuntimeException($listing['product_name'] . ' has expired and is no longer available.');
+                }
+                if (in_array($batch['current_status'], ['sold', 'rejected'], true)) {
+                    throw new RuntimeException($listing['product_name'] . ' is no longer available.');
+                }
+                $sellingUnit = $listing['selling_unit'] === 'other'
+                    ? $listing['unit']
+                    : ($listing['selling_unit'] ?: $listing['unit']);
+                if (strtolower((string) $sellingUnit) !== strtolower((string) $batch['unit'])) {
+                    throw new RuntimeException($listing['product_name'] . ' is sold in a unit that does not match its batch inventory unit.');
+                }
+                if ($batch['selling_unit'] !== null
+                    && strtolower((string) $batch['selling_unit']) !== strtolower((string) $listing['selling_unit'])) {
+                    throw new RuntimeException($listing['product_name'] . ' has a marketplace listing that does not match its batch selling unit.');
+                }
+                if ($batch['unit_price'] !== null) {
+                    $listing['price'] = (float) $batch['unit_price'];
+                }
+                if ($available < $line['quantity']) {
+                    throw new RuntimeException('Not enough batch stock for ' . $listing['product_name'] . '.');
+                }
+                $changed = $this->db->raw(
+                    'UPDATE product_batches
+                     SET available_quantity = COALESCE(available_quantity, quantity) - ?
+                     WHERE batch_id = ? AND COALESCE(available_quantity, quantity) >= ?',
+                    [$line['quantity'], (int) $batch['batch_id'], $line['quantity']]
+                );
+                if ($changed->rowCount() !== 1) {
+                    throw new RuntimeException('Batch stock changed while placing your order. Please review your cart.');
+                }
+                $sellerId = (int) $listing['seller_id'];
+                $preparedBySeller[$sellerId][] = [
+                    'listing' => $listing, 'batch' => $batch, 'quantity' => $line['quantity'],
+                    'cart_added_at' => $line['cart_added_at']
+                ];
+                $sellerTotals[$sellerId] = ($sellerTotals[$sellerId] ?? 0)
+                    + (float) $listing['price'] * $line['quantity'];
             }
 
-            $orderId = (int) $this->db->table('orders')->insert([
-                'buyer_id' => $buyer, 'total_amount' => round($total, 2),
-            ]);
-
-            foreach ($prepared as $row) {
-                $listing = $row['listing'];
-                $this->db->table('order_items')->insert([
-                    'order_id' => $orderId, 'listing_id' => $listing['listing_id'], 'seller_id' => $listing['seller_id'],
-                    'product_name' => $listing['product_name'], 'unit_price' => $listing['price'],
-                    'quantity' => $row['quantity'], 'unit' => $listing['unit'],
+            $orders = [];
+            foreach ($preparedBySeller as $sellerId => $sellerItems) {
+                $orderId = (int) $this->db->table('orders')->insert([
+                    'buyer_id' => $buyer,
+                    'seller_id' => $sellerId,
+                    'checkout_key' => $checkoutKey,
+                    'delivery_address' => $deliveryAddress,
+                    'total_amount' => round($sellerTotals[$sellerId], 2),
+                    'payment_method' => $paymentMethod,
+                    'status' => 'pending',
+                    'payment_status' => 'unpaid'
                 ]);
-                $this->community->decrement_stock($listing['listing_id'], $row['quantity']);
+                foreach ($sellerItems as $row) {
+                    $listing = $row['listing'];
+                    $batch = $row['batch'];
+                    $itemId = (int) $this->db->table('order_items')->insert([
+                        'order_id' => $orderId, 'listing_id' => $listing['listing_id'], 'seller_id' => $listing['seller_id'],
+                        'product_name' => $listing['product_name'], 'unit_price' => $listing['price'],
+                        'quantity' => $row['quantity'], 'unit' => $batch['unit'],
+                        'selling_unit' => $listing['selling_unit'] ?: $batch['unit'],
+                        'batch_unit' => $batch['unit'], 'batch_id' => $batch['batch_id'],
+                        'batch_code' => $batch['batch_code'], 'farm_id' => $batch['farm_id'],
+                        'farm_name' => $batch['farm_name'], 'harvest_date' => $batch['harvest_date'],
+                        'expiration_date' => $batch['expiration_date'],
+                        'cart_added_at' => $row['cart_added_at'],
+                        'catalog_id' => $listing['catalog_id'] ?? null,
+                        'subtotal' => round((float) $listing['price'] * $row['quantity'], 2),
+                    ]);
+                    $this->db->table('batch_allocations')->insert([
+                        'order_item_id' => $itemId,
+                        'batch_id' => $batch['batch_id'],
+                        'quantity' => $row['quantity'],
+                        'created_by' => $buyer
+                    ]);
+                    $this->db->table('inventory_movements')->insert([
+                        'listing_id' => $listing['listing_id'],
+                        'batch_id' => $batch['batch_id'],
+                        'order_id' => $orderId,
+                        'movement_type' => 'reserve',
+                        'quantity' => $row['quantity'],
+                        'unit' => $batch['unit'],
+                        'reference' => 'ORDER-' . $orderId,
+                        'created_by' => $buyer
+                    ]);
+                }
+                $this->payments->record_order_event($orderId, 'pending', 'unpaid', 'Order placed; batch inventory reserved.', $buyer);
+                $orders[] = [
+                    'order_id' => $orderId,
+                    'seller_id' => $sellerId,
+                    'total' => round($sellerTotals[$sellerId], 2),
+                    'payment_method' => $paymentMethod
+                ];
             }
             $this->db->commit();
+            foreach ($orders as $createdOrder) {
+                $this->platform->notify(
+                    (int) $createdOrder['seller_id'],
+                    'New marketplace order',
+                    'Order #' . $createdOrder['order_id'] . ' is waiting for your review.'
+                );
+                $this->platform->audit($buyer, 'PLACE_ORDER', 'Order', (int) $createdOrder['order_id'], 'Reserved batch inventory; ' . $paymentMethod . ' payment');
+            }
         } catch (RuntimeException $e) {
             $this->db->roll_back();
             $this->api->respond_error($e->getMessage(), 422);
@@ -178,27 +359,22 @@ class CommerceController extends Controller
             $this->api->respond_error('The order could not be placed. Please try again.', 500);
         }
 
-        // Open the payment invoice. If Xendit refuses, release the reservation.
-        $order = $this->payments->order_with_buyer($orderId);
-        try {
-            $returnUrl = $this->payment_return_url($returnOrigin, $orderId);
-            $invoice = $xendit->create_invoice($this->invoice_payload($order, $this->payments->order_items($orderId), $returnUrl));
-        } catch (RuntimeException $e) {
-            $this->payments->mark_expired($orderId);
-            $this->platform->audit($buyer, 'PAYMENT_START_FAILED', 'Order', $orderId, $e->getMessage());
-            $this->api->respond_error('Payment could not be started: ' . $e->getMessage(), 502);
+        foreach ($orders as $createdOrder) {
+            $this->platform->notify(
+                $buyer,
+                'Order #' . $createdOrder['order_id'] . ' placed',
+                $paymentMethod === 'cod'
+                    ? 'Your COD order is waiting for farmer review.'
+                    : 'Your online-payment order is waiting for farmer review. Payment opens after acceptance.'
+            );
         }
-
-        $this->payments->save_invoice($orderId, $invoice['id'], $invoice['invoice_url'], $invoice['external_id']);
-        $this->platform->notify($buyer, 'Order #' . $orderId . ' created', 'Complete the payment to confirm your order.');
-        $this->platform->audit($buyer, 'PLACE_ORDER', 'Order', $orderId, count($prepared) . ' item(s)');
-
         $this->api->respond([
-            'message' => 'Order created. Continue to payment to confirm it.',
-            'order_id' => $orderId,
-            'total' => round($total, 2),
+            'message' => count($orders) > 1
+                ? 'Your cart was split into separate orders for each farmer.'
+                : 'Your order was placed and is waiting for farmer review.',
+            'orders' => $orders,
             'payment_status' => 'unpaid',
-            'invoice_url' => $invoice['invoice_url']
+            'payment_method' => $paymentMethod
         ], 201);
     }
 
@@ -239,9 +415,9 @@ class CommerceController extends Controller
             if ($this->payments->mark_paid($orderId)) {
                 $this->after_payment($orderId);
             }
-        } elseif ($status === 'EXPIRED') {
+        } elseif (in_array($status, ['EXPIRED', 'FAILED', 'CANCELLED'], true)) {
             if ($this->payments->mark_expired($orderId)) {
-                $this->platform->audit((int) $order['buyer_id'], 'PAYMENT_EXPIRED', 'Order', $orderId, 'Stock released');
+                $this->platform->audit((int) $order['buyer_id'], 'PAYMENT_FAILED', 'Order', $orderId, 'Batch reservation released');
             }
         }
 
@@ -258,7 +434,9 @@ class CommerceController extends Controller
 
         foreach ($traces as $trace) {
             try {
-                $png = $qr->png(config_item('app_public_url') . '/trace.html?code=' . $trace['trace_code']);
+                $traceUrl = rtrim((string) config_item('app_frontend_url'), '/')
+                    . '/trace?code=' . rawurlencode($trace['trace_code']);
+                $png = $qr->png($traceUrl);
                 $stored = $cloud->put('qr/' . $trace['trace_code'] . '.png', $png, 'image/png');
                 $this->payments->set_trace_qr($trace['trace_id'], $stored['url']);
             } catch (Throwable $e) {

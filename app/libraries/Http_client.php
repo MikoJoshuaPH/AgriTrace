@@ -11,7 +11,7 @@ class Http_client
      * @return array{status:int, body:string, headers:array<string,string>}
      * @throws RuntimeException when the request cannot be made
      */
-    public function request($method, $url, array $headers = [], $body = null, $timeout = 20)
+    public function request($method, $url, array $headers = [], $body = null, $timeout = 20, $follow_location = true)
     {
         $header_lines = [];
         foreach ($headers as $name => $value) {
@@ -25,7 +25,7 @@ class Http_client
                 'content'       => $body,
                 'timeout'       => $timeout,
                 'ignore_errors' => true,
-                'follow_location' => 1,
+                'follow_location' => $follow_location ? 1 : 0,
             ],
         ]);
 

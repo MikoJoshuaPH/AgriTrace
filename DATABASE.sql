@@ -12,6 +12,8 @@ USE AgriTrace;
 -- Drop existing tables (reverse dependency order) so the script can be re-run
 SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS farmer_application_history;
+DROP TABLE IF EXISTS farmer_applications;
 DROP TABLE IF EXISTS weather_records;
 DROP TABLE IF EXISTS notifications;
 DROP TABLE IF EXISTS markets;
@@ -78,8 +80,48 @@ CREATE TABLE farms (
     longitude       DECIMAL(10,7) NULL,
     farm_size       DECIMAL(10,2) NULL,
     farm_size_unit  VARCHAR(20) NULL,
+    farm_description TEXT NULL,
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_farms_farmer FOREIGN KEY (farmer_id) REFERENCES users(id)
+) ENGINE=InnoDB;
+
+-- 2a. farmer account applications -----------------------------------
+CREATE TABLE farmer_applications (
+    application_id  INT AUTO_INCREMENT PRIMARY KEY,
+    applicant_id    INT NOT NULL,
+    farm_name       VARCHAR(150) NOT NULL,
+    farm_address    TEXT NULL,
+    province        VARCHAR(100) NULL,
+    municipality    VARCHAR(100) NULL,
+    barangay        VARCHAR(100) NULL,
+    latitude        DECIMAL(10,7) NULL,
+    longitude       DECIMAL(10,7) NULL,
+    farm_size       DECIMAL(10,2) NULL,
+    farm_size_unit  VARCHAR(20) NULL,
+    farm_description TEXT NULL,
+    status          ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+    rejection_reason VARCHAR(500) NULL,
+    reviewed_by     INT NULL,
+    reviewed_at     DATETIME NULL,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_farmer_applicant_status (applicant_id, status),
+    INDEX idx_farmer_application_status (status),
+    CONSTRAINT fk_farmer_application_applicant FOREIGN KEY (applicant_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_farmer_application_reviewer FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE farmer_application_history (
+    history_id      INT AUTO_INCREMENT PRIMARY KEY,
+    application_id  INT NOT NULL,
+    previous_status ENUM('pending','approved','rejected') NULL,
+    new_status      ENUM('pending','approved','rejected') NOT NULL,
+    changed_by      INT NOT NULL,
+    reason          VARCHAR(500) NULL,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_farmer_application_history_application (application_id, history_id),
+    CONSTRAINT fk_farmer_application_history_application FOREIGN KEY (application_id) REFERENCES farmer_applications(application_id) ON DELETE CASCADE,
+    CONSTRAINT fk_farmer_application_history_user FOREIGN KEY (changed_by) REFERENCES users(id)
 ) ENGINE=InnoDB;
 
 -- 3. products --------------------------------------------------------
@@ -102,11 +144,16 @@ CREATE TABLE marketplace_listings (
     price           DECIMAL(12,2) NOT NULL,
     stock           DECIMAL(12,2) NOT NULL,
     unit            VARCHAR(30) NOT NULL,
+    selling_unit    VARCHAR(30) NULL,
+    catalog_id      INT NULL,
+    farm_id         INT NULL,
+    batch_id        INT NULL,
     location        VARCHAR(255) NULL,
     image_url       VARCHAR(2048) NULL,
     is_available    TINYINT(1) NOT NULL DEFAULT 1,
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_listing_seller FOREIGN KEY (seller_id) REFERENCES users(id)
+    CONSTRAINT fk_listing_seller FOREIGN KEY (seller_id) REFERENCES users(id),
+    CONSTRAINT fk_listing_farm FOREIGN KEY (farm_id) REFERENCES farms(farm_id)
 ) ENGINE=InnoDB;
 
 -- 3b. community_posts ----------------------------------------------
@@ -132,6 +179,7 @@ CREATE TABLE product_batches (
     quantity        DECIMAL(12,2) NOT NULL,
     unit            VARCHAR(30) NOT NULL,
     harvest_date    DATE NULL,
+    expiration_date DATE NULL,
     product_image   VARCHAR(255) NULL,
     current_status  ENUM('harvested','collected','in_transit','received','available_at_market','sold','rejected')
                     NOT NULL DEFAULT 'harvested',

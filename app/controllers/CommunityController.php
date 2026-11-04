@@ -6,6 +6,7 @@ class CommunityController extends Controller
 {
     private $model;
     private $platform;
+    private $catalog;
 
     public function __construct()
     {
@@ -14,6 +15,7 @@ class CommunityController extends Controller
         $this->call->library('api');
         $this->model = $this->call->model('Community_model');
         $this->platform = $this->call->model('Platform_model');
+        $this->catalog = $this->call->model('Catalog_model');
     }
 
     /** GET /api/marketplace  (?mine=1 returns the caller's own listings) */
@@ -23,7 +25,41 @@ class CommunityController extends Controller
         $auth = $this->api->require_jwt();
         $query = $this->api->get_query_params();
         $mine = !empty($query['mine']);
-        $this->api->respond(['data' => $this->model->listListings((int) $auth['sub'], $query['limit'] ?? 100, $mine)]);
+        $this->api->respond(['data' => $this->model->listListings((int) $auth['sub'], $query['limit'] ?? 100, $mine, $query)]);
+    }
+
+    /** GET /api/search — related Marketplace, FarmerHub, and registered farm results. */
+    public function search()
+    {
+        $this->api->require_method('GET');
+        $auth = $this->api->require_jwt();
+        $query = $this->api->get_query_params();
+        $term = $query['q'] ?? '';
+        if (!is_string($term)) {
+            $this->api->respond_error('Search query must be text.', 422);
+        }
+        $term = trim($term);
+        if (mb_strlen($term) < 2 || mb_strlen($term) > 100) {
+            $this->api->respond_error('Search must be between 2 and 100 characters.', 422);
+        }
+
+        $farmers = $this->platform->farmers((int) $auth['sub']);
+        $matchingFarmers = array_values(array_filter($farmers, static function ($farmer) use ($term) {
+            $profile = implode(' ', array_filter([
+                $farmer['first_name'] ?? '',
+                $farmer['middle_name'] ?? '',
+                $farmer['last_name'] ?? '',
+                $farmer['username'] ?? '',
+                $farmer['farm_name'] ?? '',
+                $farmer['municipality'] ?? '',
+                $farmer['province'] ?? ''
+            ]));
+            return stripos($profile, $term) !== false;
+        }));
+
+        $this->api->respond([
+            'data' => $this->model->searchNavigation((int) $auth['sub'], $term, $matchingFarmers, $farmers)
+        ]);
     }
 
     /** GET /api/marketplace/{id}/reviews — reviews and purchase eligibility for the current user. */
@@ -105,25 +141,162 @@ class CommunityController extends Controller
         $this->api->respond(['message' => 'Your comment has been posted.'], 201);
     }
 
-    /** POST /api/marketplace — listings from non-admins wait for admin approval. */
+    /** POST /api/marketplace — publish a product listing immediately. */
     public function storeListing()
     {
         $auth = $this->authenticateWrite();
+        if (!in_array($auth['role'] ?? '', ['admin', 'farmer'], true)) {
+            $this->api->respond_error('Only farmers and administrators can list products.', 403);
+        }
         $input = $this->api->body();
+        if (!empty($input['product_draft'])) {
+            if (($auth['role'] ?? '') !== 'farmer') {
+                $this->api->respond_error('Only farmers can save products before creating a harvest batch.', 403);
+            }
+            $productName = trim((string) ($input['product_name'] ?? ''));
+            $category = trim((string) ($input['category'] ?? ''));
+            $farmId = filter_var($input['farm_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            $imageUrl = $input['image_url'] ?? '';
+            if ($productName === '' || mb_strlen($productName) > 150 || $category === '' || mb_strlen($category) > 100) {
+                $this->api->respond_error('Enter a product name and category.', 422);
+            }
+            if ($farmId === false || !$this->model->farmBelongsToFarmer((int) $farmId, (int) $auth['sub'])) {
+                $this->api->respond_error('Select a registered farm that belongs to your account.', 403);
+            }
+            if (!is_string($imageUrl) || strlen($imageUrl) > 2048) {
+                $this->api->respond_error('Product image URL is invalid.', 422);
+            }
+            $catalogId = $this->catalog->createOrGet($productName, $category, 'unit');
+            $id = $this->model->createListing((int) $auth['sub'], [
+                'product_name' => $productName,
+                'category' => $category,
+                'description' => trim((string) ($input['description'] ?? '')),
+                'price' => 0,
+                'stock' => 0,
+                'unit' => 'unit',
+                'selling_unit' => 'other',
+                'catalog_id' => $catalogId,
+                'farm_id' => (int) $farmId,
+                'batch_id' => null,
+                'image_url' => trim($imageUrl)
+            ], false);
+            $this->platform->audit((int) $auth['sub'], 'SAVE_PRODUCT_DRAFT', 'Listing', $id, $productName);
+            $this->api->respond([
+                'message' => 'Product saved. Create a new batch to publish it to the marketplace and feed.',
+                'id' => $id,
+                'status' => 'draft'
+            ], 201);
+        }
         $input = $this->validateListing($input);
-        $isAdmin = ($auth['role'] ?? '') === 'admin';
-
-        $id = $this->model->createListing((int) $auth['sub'], $input, $isAdmin);
+        if (($auth['role'] ?? '') === 'farmer') {
+            if (empty($input['farm_id']) || !$this->model->farmBelongsToFarmer((int) $input['farm_id'], (int) $auth['sub'])) {
+                $this->api->respond_error('Select a registered farm that belongs to your account.', 403);
+            }
+            $batch = empty($input['batch_id']) ? null : $this->model->batchForFarmer((int) $input['batch_id'], (int) $auth['sub']);
+            if (!$batch) {
+                $this->api->respond_error('Select a batch from your registered farm.', 422);
+            }
+            if ((int) $batch['farm_id'] !== (int) $input['farm_id']) {
+                $this->api->respond_error('The selected batch must belong to the selected farm.', 422);
+            }
+            $sellingUnit = $input['selling_unit'] === 'other' ? $input['unit'] : $input['selling_unit'];
+            if (strtolower((string) $sellingUnit) !== strtolower((string) $batch['unit'])) {
+                $this->api->respond_error('Choose a selling unit that matches the selected batch inventory unit.', 422);
+            }
+            if (!empty($input['catalog_id']) && (int) $input['catalog_id'] !== (int) $batch['product_id']) {
+                $this->api->respond_error('The selected product does not match the selected harvest batch.', 422);
+            }
+            $input['stock'] = $batch['stock'];
+            $input['unit'] = $batch['unit'];
+        }
+        if (empty($input['catalog_id'])) {
+            $input['catalog_id'] = $this->catalog->createOrGet($input['product_name'], $input['category'], $input['unit']);
+        }
+        $id = $this->model->createListing((int) $auth['sub'], $input, true);
         $this->platform->audit((int) $auth['sub'], 'CREATE_LISTING', 'Listing', $id, $input['product_name']);
 
         $this->api->respond([
-            'message' => $isAdmin ? 'Product published.' : 'Product submitted. It will appear in the marketplace after admin approval.',
+            'message' => 'Product published.',
             'id' => $id,
-            'status' => $isAdmin ? 'approved' : 'pending'
+            'status' => 'approved'
         ], 201);
     }
 
-    /** GET /api/posts — approved posts, plus the caller's own pending posts. */
+    /** PUT /api/marketplace/{id} — update a seller's own product listing. */
+    public function updateListing($id)
+    {
+        $this->api->require_method('PUT');
+        $auth = $this->api->require_jwt();
+        $listingId = filter_var($id, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        $listing = $listingId === false ? null : $this->model->listing_owner($listingId);
+        if (!$listing) {
+            $this->api->respond_error('Product not found.', 404);
+        }
+        if ((int) $listing['seller_id'] !== (int) $auth['sub']) {
+            $this->api->respond_error('You can only edit your own product listings.', 403);
+        }
+
+        $body = $this->api->body();
+        if (!empty($body['product_details_only'])) {
+            if (($auth['role'] ?? '') !== 'farmer') {
+                $this->api->respond_error('Product details can only be edited by the farmer who posted them.', 403);
+            }
+            $productName = trim((string) ($body['product_name'] ?? ''));
+            $category = trim((string) ($body['category'] ?? ''));
+            $description = trim((string) ($body['description'] ?? ''));
+            $imageUrl = $body['image_url'] ?? '';
+            if ($productName === '' || mb_strlen($productName) > 150 || $category === '' || mb_strlen($category) > 100) {
+                $this->api->respond_error('Enter a product name (up to 150 characters) and category (up to 100 characters).', 422);
+            }
+            if (mb_strlen($description) > 10000 || !is_string($imageUrl) || strlen($imageUrl) > 2048) {
+                $this->api->respond_error('Product description or image URL is invalid.', 422);
+            }
+            $input = [
+                'product_name' => $productName,
+                'category' => $category,
+                'description' => $description,
+                'image_url' => trim($imageUrl)
+            ];
+            $this->model->updateProductDetails($listingId, (int) $auth['sub'], $input);
+            $this->platform->audit((int) $auth['sub'], 'UPDATE_PRODUCT_DETAILS', 'Listing', $listingId, $productName);
+            $this->api->respond(['message' => 'Product details updated successfully.']);
+        }
+        if (!array_key_exists('image_url', $body)) {
+            $body['image_url'] = $listing['image_url'] ?? '';
+        }
+        if (!array_key_exists('batch_id', $body)) {
+            $body['batch_id'] = $listing['batch_id'] ?? null;
+        }
+        $input = $this->validateListing($body, true);
+        if (($auth['role'] ?? '') === 'farmer' &&
+            (empty($input['farm_id']) || !$this->model->farmBelongsToFarmer((int) $input['farm_id'], (int) $auth['sub']))) {
+            $this->api->respond_error('Select a registered farm that belongs to your account.', 403);
+        }
+        if (($auth['role'] ?? '') === 'farmer') {
+            $batch = $this->model->batchForFarmer((int) ($input['batch_id'] ?? 0), (int) $auth['sub']);
+            if (!$batch || (int) $batch['farm_id'] !== (int) $input['farm_id']) {
+                $this->api->respond_error('Select a batch from the selected registered farm.', 422);
+            }
+            $sellingUnit = $input['selling_unit'] === 'other' ? $input['unit'] : $input['selling_unit'];
+            if (strtolower((string) $sellingUnit) !== strtolower((string) $batch['unit'])) {
+                $this->api->respond_error('Choose a selling unit that matches the selected batch inventory unit.', 422);
+            }
+            if (!empty($input['catalog_id']) && (int) $input['catalog_id'] !== (int) $batch['product_id']) {
+                $this->api->respond_error('The selected product does not match the selected harvest batch.', 422);
+            }
+            $input['stock'] = $batch['stock'];
+            $input['unit'] = $batch['unit'];
+        }
+        $this->model->updateListing($listingId, $input);
+        if (($auth['role'] ?? '') === 'farmer' && !empty($input['batch_id'])) {
+            $this->model->updateBatchPrice((int) $input['batch_id'], $input['price']);
+        }
+        $this->model->update_listing_image($listingId, $input['image_url']);
+        $this->platform->audit((int) $auth['sub'], 'UPDATE_LISTING', 'Listing', $listingId, $input['product_name']);
+        $this->api->respond(['message' => 'Product updated successfully.']);
+    }
+
+    /** GET /api/posts — published community posts. */
     public function posts()
     {
         $this->api->require_method('GET');
@@ -132,7 +305,7 @@ class CommunityController extends Controller
         $this->api->respond(['data' => $this->model->listPosts((int) $auth['sub'], $query['limit'] ?? 100)]);
     }
 
-    /** POST /api/posts — non-admin posts start as "pending" until an admin approves them. */
+    /** POST /api/posts — publish immediately without an approval queue. */
     public function storePost()
     {
         $auth = $this->authenticateWrite();
@@ -144,7 +317,22 @@ class CommunityController extends Controller
             $this->api->respond_error('Post content is required.', 422);
         }
 
+        $postType = trim((string) ($input['post_type'] ?? 'text')) ?: 'text';
+        if (!in_array($postType, ['text', 'media', 'product'], true)) {
+            $this->api->respond_error('Post type must be text, media, or product.', 422);
+        }
+        $role = $auth['role'] ?? '';
+        if (!in_array($role, ['admin', 'farmer', 'collector'], true)) {
+            $this->api->respond_error('Only farmers, buyers, and administrators can publish posts.', 403);
+        }
+        if ($postType === 'product' && !in_array($role, ['admin', 'farmer'], true)) {
+            $this->api->respond_error('Only farmers and administrators can publish product posts.', 403);
+        }
+
         $listingId = !empty($input['listing_id']) ? (int) $input['listing_id'] : null;
+        if (($postType === 'product') !== ($listingId !== null)) {
+            $this->api->respond_error('Product posts must link to a product listing, and other posts cannot link a listing.', 422);
+        }
         if ($listingId !== null) {
             $listing = $this->model->listing_owner($listingId);
             if (!$listing || (int) $listing['seller_id'] !== $userId) {
@@ -152,28 +340,68 @@ class CommunityController extends Controller
             }
         }
 
-        $isAdmin = ($auth['role'] ?? '') === 'admin';
         $id = $this->model->createPost($userId, [
             'content' => $content,
-            'post_type' => trim((string) ($input['post_type'] ?? 'text')) ?: 'text',
+            'post_type' => $postType,
             'listing_id' => $listingId,
             'media_url' => trim((string) ($input['media_url'] ?? '')),
             'media_type' => trim((string) ($input['media_type'] ?? ''))
-        ], $isAdmin ? 'approved' : 'pending');
+        ], 'approved');
 
         $this->platform->audit($userId, 'CREATE_POST', 'Post', $id, $content);
         $this->api->respond([
-            'message' => $isAdmin ? 'Post published successfully.' : 'Post submitted. It will appear after admin approval.',
+            'message' => 'Post published successfully.',
             'id' => $id,
-            'status' => $isAdmin ? 'approved' : 'pending'
+            'status' => 'approved'
         ], 201);
     }
 
-    /** POST /api/media — stores an image or video under public/uploads/community. */
+    /** POST /api/posts/{id}/reports — reports a post for administrator review. */
+    public function report_post($id)
+    {
+        $this->api->require_method('POST');
+        $auth = $this->api->require_jwt();
+        $postId = filter_var($id, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        $post = $postId === false ? null : $this->model->post_for_report($postId);
+        if (!$post || $post['status'] !== 'approved') {
+            $this->api->respond_error('Post not found.', 404);
+        }
+        if ((int) $post['author_id'] === (int) $auth['sub']) {
+            $this->api->respond_error('You cannot report your own post.', 403);
+        }
+
+        $input = $this->api->body();
+        if (!is_string($input['reason'] ?? null)) {
+            $this->api->respond_error('Please describe the issue in 1 to 255 characters.', 422);
+        }
+        $reason = trim($input['reason']);
+        if ($reason === '' || mb_strlen($reason) > 255) {
+            $this->api->respond_error('Please describe the issue in 1 to 255 characters.', 422);
+        }
+
+        $reportId = $this->platform->create_post_report(
+            (int) $auth['sub'],
+            (int) $post['author_id'],
+            (int) $postId,
+            $reason,
+            $post
+        );
+        $this->platform->audit((int) $auth['sub'], 'REPORT_POST', 'Post', (int) $postId, $reason);
+        $this->api->respond(['message' => 'Your report was sent to the administrator for review.', 'report_id' => $reportId], 201);
+    }
+
+    /** POST /api/media — stores an image or video in the public media bucket. */
     public function uploadMedia()
     {
         $this->api->require_method('POST');
-        $this->api->require_jwt();
+        $auth = $this->api->require_jwt();
+        $folder = (string) ($_POST['folder'] ?? 'community');
+        if (!in_array($folder, ['community', 'profiles'], true)) {
+            $this->api->respond_error('Invalid media folder.', 422);
+        }
+        if ($folder === 'community' && !in_array($auth['role'] ?? '', ['admin', 'farmer', 'collector'], true)) {
+            $this->api->respond_error('Only farmers, buyers, and administrators can upload post media.', 403);
+        }
 
         if (empty($_FILES['media']) || $_FILES['media']['error'] !== UPLOAD_ERR_OK) {
             $this->api->respond_error('Please choose a photo or video to upload.', 422);
@@ -203,10 +431,10 @@ class CommunityController extends Controller
 
         $cloud = $this->call->library('Cloud_storage');
         try {
-            $stored = $cloud->put('community/' . date('Ym') . '/' . bin2hex(random_bytes(16)) . '.' . $extension,
+            $stored = $cloud->put('users/' . (int) $auth['sub'] . '/' . date('Y-m-d') . '/' . bin2hex(random_bytes(16)) . '.' . $extension,
                 file_get_contents($file['tmp_name']), $mime);
         } catch (RuntimeException $e) {
-            $this->api->respond_error('The media upload could not be saved.', 500);
+            $this->api->respond_error('The media upload could not be saved: ' . $e->getMessage(), 502);
         }
 
         $this->api->respond([
@@ -217,26 +445,47 @@ class CommunityController extends Controller
         ], 201);
     }
 
-    private function validateListing(array $input)
+    private function validateListing(array $input, $allowZeroStock = false)
     {
         $productName = trim((string) ($input['product_name'] ?? ''));
         $category = trim((string) ($input['category'] ?? ''));
         $unit = trim((string) ($input['unit'] ?? ''));
         $price = filter_var($input['price'] ?? null, FILTER_VALIDATE_FLOAT);
         $stock = filter_var($input['stock'] ?? null, FILTER_VALIDATE_FLOAT);
+        $batchId = filter_var($input['batch_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        $imageUrl = $input['image_url'] ?? '';
+        $sellingUnit = trim((string) ($input['selling_unit'] ?? ''));
+        $farmId = filter_var($input['farm_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        $allowedSellingUnits = ['piece', 'kg', 'bundle', 'pack', 'sack', 'box', 'dozen', 'set', 'liter', 'other'];
 
-        if ($productName === '' || $category === '' || $unit === '' || $price === false || $price < 0 || $stock === false || $stock <= 0) {
-            $this->api->respond_error('Product name, category, unit, price, and stock are required.', 422);
+        if ($productName === '' || $category === '' || $unit === '' || $price === false || $price < 0 || $batchId === false) {
+            $this->api->respond_error('Product name, category, price, and batch are required.', 422);
+        }
+        if (!in_array($sellingUnit, $allowedSellingUnits, true)) {
+            $this->api->respond_error('Choose a valid selling unit.', 422);
+        }
+        if ($sellingUnit !== 'other') {
+            $unit = $sellingUnit;
+        }
+        if ($sellingUnit === 'other' && $unit === '') {
+            $this->api->respond_error('Enter a label for the selling unit.', 422);
+        }
+        if (!is_string($imageUrl) || strlen($imageUrl) > 2048) {
+            $this->api->respond_error('Product image URL is invalid.', 422);
         }
         return [
             'product_name' => $productName,
             'category' => $category,
             'description' => trim((string) ($input['description'] ?? '')),
             'price' => $price,
-            'stock' => $stock,
+            'stock' => $stock === false ? 0 : $stock,
             'unit' => $unit,
+            'selling_unit' => $sellingUnit,
+            'catalog_id' => !empty($input['catalog_id']) ? (int) $input['catalog_id'] : null,
+            'farm_id' => $farmId === false ? null : (int) $farmId,
+            'batch_id' => (int) $batchId,
             'location' => trim((string) ($input['location'] ?? '')),
-            'image_url' => trim((string) ($input['image_url'] ?? ''))
+            'image_url' => trim($imageUrl)
         ];
     }
 

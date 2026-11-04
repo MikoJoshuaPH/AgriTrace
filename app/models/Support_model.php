@@ -23,6 +23,34 @@ class Support_model extends Model
             ->get_all(PDO::FETCH_ASSOC);
     }
 
+    public function resolved_complaints()
+    {
+        return $this->db->table('support_complaints')
+            ->select('complaint_id, reporter_name, reporter_email, message, status, created_at, resolved_at')
+            ->where('status', 'resolved')
+            ->order_by('resolved_at', 'DESC')
+            ->limit(100)
+            ->get_all(PDO::FETCH_ASSOC);
+    }
+
+    public function all_complaints()
+    {
+        return $this->db->table('support_complaints')
+            ->select('complaint_id, reporter_name, reporter_email, message, status, created_at, resolved_at')
+            ->order_by('complaint_id', 'DESC')
+            ->limit(100)
+            ->get_all(PDO::FETCH_ASSOC);
+    }
+
+    public function complaint($complaintId)
+    {
+        return $this->db->table('support_complaints')
+            ->select('complaint_id, reporter_name, reporter_email, message, status, created_at, resolved_at')
+            ->where('complaint_id', $complaintId)
+            ->limit(1)
+            ->get(PDO::FETCH_ASSOC);
+    }
+
     public function complaint_exists($complaintId)
     {
         return (bool) $this->db->table('support_complaints')
@@ -31,9 +59,8 @@ class Support_model extends Model
 
     public function resolve_complaint($complaintId)
     {
-        return $this->db->table('support_complaints')->where('complaint_id', $complaintId)->update([
-            'status' => 'resolved',
-            'resolved_at' => date('Y-m-d H:i:s'),
-        ]);
+        return $this->db->table('support_complaints')
+            ->where(['complaint_id' => $complaintId, 'status' => 'open'])
+            ->update(['status' => 'resolved', 'resolved_at' => date('Y-m-d H:i:s')]);
     }
 }

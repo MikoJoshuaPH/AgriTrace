@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Puter read URLs and product media galleries exceed the original 255-char
+ * Cloud storage read URLs and product media galleries exceed the original 255-char
  * columns. Keep their full URLs so the database can render uploaded media.
  */
 class expand_media_url_columns
@@ -24,6 +24,6 @@ class expand_media_url_columns
 
     public function down()
     {
-        // Shrinking these columns could truncate existing Puter URLs or galleries.
+        // Shrinking these columns could truncate cloud URLs or product media galleries.
     }
 }

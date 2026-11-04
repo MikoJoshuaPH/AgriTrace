@@ -20,7 +20,7 @@ class SocialController extends Controller
         $this->platform = $this->call->model('Platform_model');
     }
 
-    /** DELETE /api/posts/{id} — authors can delete their posts; admins can delete any post (rejecting pending ones). */
+    /** DELETE /api/posts/{id} — authors can delete their posts; admins can remove any post. */
     public function delete_post($id)
     {
         $this->api->require_method('DELETE');
@@ -33,9 +33,6 @@ class SocialController extends Controller
             $this->api->respond_error('You can only delete your own posts.', 403);
         }
         $this->community->delete_post((int) $id);
-        if ((int) $post['author_id'] !== $userId && $post['status'] === 'pending') {
-            $this->platform->notify((int) $post['author_id'], 'Post not approved', 'An administrator removed your post.');
-        }
         $this->platform->audit($userId, 'DELETE_POST', 'Post', (int) $id, null);
         $this->api->respond(['message' => 'Post deleted.']);
     }
@@ -164,16 +161,33 @@ class SocialController extends Controller
         }
 
         $member = $this->db->table('users')
-            ->select('id, username, first_name, last_name, role, profile_pic, is_verified, is_active, created_at')
+            ->select('id, username, first_name, middle_name, last_name, role, profile_pic, is_verified, is_active, created_at')
             ->where(['id' => $id, 'is_active' => 1])
             ->limit(1)
             ->get(PDO::FETCH_ASSOC);
-        if (!$member) {
+        if (!$member || $member['role'] !== 'farmer') {
             $this->api->respond_error('Member not found.', 404);
         }
 
         $member['following'] = (int) $auth['sub'] !== (int) $id
             && $this->platform->is_following((int) $auth['sub'], (int) $id);
+        $member['followers'] = (int) $this->db->table('user_follows')->where('followee_id', (int) $id)->count();
+        $member['farms'] = $this->db->raw(
+            'SELECT farm_id, farm_name, farm_description, municipality, province, latitude, longitude, farm_size, farm_size_unit
+             FROM farms WHERE farmer_id = ? ORDER BY farm_id DESC',
+            [(int) $id]
+        )->fetchAll(PDO::FETCH_ASSOC);
+        $member['posts'] = $this->community->listPosts((int) $auth['sub'], 100, (int) $id);
+        $member['products'] = $this->community->listings_by_seller((int) $id);
+        $member['review_summary'] = $this->db->raw(
+            'SELECT COUNT(r.review_id) AS review_count, COALESCE(AVG(r.rating), 0) AS average_rating
+             FROM product_reviews r
+             INNER JOIN marketplace_listings l ON l.listing_id = r.listing_id
+             WHERE l.seller_id = ?',
+            [(int) $id]
+        )->fetch(PDO::FETCH_ASSOC);
+        $member['review_summary']['review_count'] = (int) $member['review_summary']['review_count'];
+        $member['review_summary']['average_rating'] = (float) $member['review_summary']['average_rating'];
         $this->api->respond($member);
     }
 
@@ -302,8 +316,8 @@ class SocialController extends Controller
     }
 
     /**
-     * Returns a post the caller may act on: approved posts, or their own pending posts
-     * (admins may act on any post). Responds 404 otherwise.
+     * Returns an approved post the caller may act on (admins may act on any post).
+     * Responds 404 otherwise.
      */
     private function visible_post($id, array $auth)
     {
