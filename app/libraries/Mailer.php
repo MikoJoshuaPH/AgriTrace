@@ -14,7 +14,8 @@ class Mailer
 {
     public function is_configured()
     {
-        return $this->uses_resend()
+        return $this->uses_mailjet()
+            || $this->uses_resend()
             || (config_item('mail_username') !== '' && config_item('mail_password') !== '');
     }
 
@@ -26,7 +27,11 @@ class Mailer
     public function send($to, $subject, $html, $text = '', array $attachments = [], $replyTo = null)
     {
         if (!$this->is_configured()) {
-            throw new RuntimeException('Email is not configured. Set the SMTP login and password in .env.');
+            throw new RuntimeException('Email is not configured. Set Mailjet, Resend, or SMTP credentials in .env.');
+        }
+        if ($this->uses_mailjet()) {
+            $this->send_with_mailjet($to, $subject, $html, $text, $attachments, $replyTo);
+            return true;
         }
         if ($this->uses_resend()) {
             $this->send_with_resend($to, $subject, $html, $text, $attachments, $replyTo);
@@ -80,6 +85,72 @@ class Mailer
     private function uses_resend()
     {
         return config_item('resend_api_key') !== '' && config_item('resend_from') !== '';
+    }
+
+    private function uses_mailjet()
+    {
+        return config_item('mailjet_api_key') !== ''
+            && config_item('mailjet_secret_key') !== ''
+            && filter_var(config_item('mailjet_from_email'), FILTER_VALIDATE_EMAIL);
+    }
+
+    private function send_with_mailjet($to, $subject, $html, $text, array $attachments = [], $replyTo = null)
+    {
+        $recipients = [];
+        foreach ((array) $to as $address) {
+            if (filter_var($address, FILTER_VALIDATE_EMAIL)) {
+                $recipients[] = ['Email' => $address];
+            }
+        }
+        if (!$recipients) {
+            throw new RuntimeException('Mailjet requires at least one valid recipient.');
+        }
+
+        $payload = [
+            'Messages' => [[
+                'From' => [
+                    'Email' => config_item('mailjet_from_email'),
+                    'Name' => config_item('mailjet_from_name'),
+                ],
+                'To' => $recipients,
+                'Subject' => $subject,
+                'HTMLPart' => $html,
+                'TextPart' => $text !== '' ? $text : strip_tags($html),
+            ]],
+        ];
+        if (is_string($replyTo) && filter_var($replyTo, FILTER_VALIDATE_EMAIL)) {
+            $payload['Messages'][0]['ReplyTo'] = ['Email' => $replyTo];
+        }
+        if ($attachments) {
+            $payload['Messages'][0]['Attachments'] = array_map(static function (array $file) {
+                return [
+                    'ContentType' => $file['type'] ?? 'application/octet-stream',
+                    'Filename' => $file['name'],
+                    'Base64Content' => base64_encode($file['content']),
+                ];
+            }, $attachments);
+        }
+
+        $http = new Http_client();
+        $response = $http->request(
+            'POST',
+            'https://api.mailjet.com/v3.1/send',
+            [
+                'Authorization' => 'Basic ' . base64_encode(
+                    config_item('mailjet_api_key') . ':' . config_item('mailjet_secret_key')
+                ),
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json',
+            ],
+            json_encode($payload, JSON_THROW_ON_ERROR),
+            20
+        );
+        $data = json_decode($response['body'], true);
+        if ($response['status'] < 200 || $response['status'] >= 300) {
+            $message = is_array($data) ? ($data['ErrorMessage'] ?? $data['ErrorInfo'] ?? '') : '';
+            throw new RuntimeException('Mailjet rejected the email request'
+                . ($message !== '' ? ': ' . $message : ' (HTTP ' . $response['status'] . ').'));
+        }
     }
 
     private function send_with_resend($to, $subject, $html, $text, array $attachments = [], $replyTo = null)
