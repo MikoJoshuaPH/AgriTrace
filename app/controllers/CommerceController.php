@@ -18,7 +18,7 @@ class CommerceController extends Controller
         $this->payments = $this->call->model('Payment_model');
     }
 
-    /** GET /api/orders — the caller's orders (admins may pass ?all=1). */
+    /** GET /api/orders — the caller's orders (admins may pass ?all=1; farmers may select buyer or managing orders). */
     public function index()
     {
         $this->api->require_method('GET');
@@ -26,8 +26,18 @@ class CommerceController extends Controller
         $query = $this->api->get_query_params();
         $isAdmin = ($auth['role'] ?? '') === 'admin';
         $all = $isAdmin && !empty($query['all']);
+        $scope = strtolower((string) ($query['scope'] ?? ''));
+        if ($scope !== '' && !in_array($scope, ['buyer', 'managing'], true)) {
+            $this->api->respond_error('Invalid order scope.', 422);
+        }
+        if ($scope === 'managing' && ($auth['role'] ?? '') !== 'farmer') {
+            $this->api->respond_error('Only farmers can manage product orders.', 403);
+        }
         if (($auth['role'] ?? '') === 'farmer' && !$all) {
-            $this->api->respond(['data' => $this->platform->orders_for_seller((int) $auth['sub'])]);
+            $orders = $scope === 'buyer'
+                ? $this->platform->orders((int) $auth['sub'])
+                : $this->platform->orders_for_seller((int) $auth['sub']);
+            $this->api->respond(['data' => $orders]);
         }
         if (($auth['role'] ?? '') === 'transporter' && !$all) {
             $this->api->respond(['data' => $this->platform->orders_for_transporter((int) $auth['sub'])]);
