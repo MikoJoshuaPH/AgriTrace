@@ -84,15 +84,23 @@ class Platform_model extends Model
 
     public function farmers($viewerId)
     {
-        $farmers = $this->db->raw(
-            'SELECT id, username, first_name, middle_name, last_name, profile_pic, is_verified,
-                    (SELECT farm_name FROM farms WHERE farms.farmer_id = users.id ORDER BY farm_id DESC LIMIT 1) AS farm_name,
-                    (SELECT municipality FROM farms WHERE farms.farmer_id = users.id ORDER BY farm_id DESC LIMIT 1) AS municipality,
-                    (SELECT province FROM farms WHERE farms.farmer_id = users.id ORDER BY farm_id DESC LIMIT 1) AS province
-             FROM users
-             WHERE role = ? AND is_active = 1 AND id <> ?',
-            ['farmer', $viewerId]
-        )->fetchAll(PDO::FETCH_ASSOC);
+        $farmerRows = $this->db->table('users')
+            ->select('users.id, users.username, users.first_name, users.middle_name, users.last_name, users.profile_pic, users.is_verified, farms.farm_id, farms.farm_name, farms.municipality, farms.province')
+            ->left_join('farms', 'farms.farmer_id = users.id')
+            ->where(['users.role' => 'farmer', 'users.is_active' => 1])
+            ->where('users.id', '<>', $viewerId)
+            ->order_by('farms.farm_id', 'DESC')
+            ->get_all(PDO::FETCH_ASSOC);
+        $farmers = [];
+        foreach ($farmerRows as $farmer) {
+            $farmerId = (int) $farmer['id'];
+            if (isset($farmers[$farmerId])) {
+                continue;
+            }
+            unset($farmer['farm_id']);
+            $farmers[$farmerId] = $farmer;
+        }
+        $farmers = array_values($farmers);
         $followerCounts = $this->db->table('user_follows')->select('followee_id')
             ->select_count('followee_id', 'followers')->group_by('followee_id')
             ->get_all(PDO::FETCH_ASSOC);
@@ -301,8 +309,10 @@ class Platform_model extends Model
     public function orders($userId = null)
     {
         $query = $this->db->table('orders')
-            ->select('orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.payment_method, orders.paid_at, orders.xendit_invoice_url, orders.delivery_address, orders.requested_delivery_at, orders.shipping_provider, orders.transaction_reference, orders.tracking_number, orders.created_at, u.username AS buyer, u.first_name AS buyer_first, u.last_name AS buyer_last, u.email AS buyer_email, u.address AS buyer_address')
+            ->select('orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.payment_method, orders.paid_at, orders.xendit_invoice_url, orders.delivery_address, orders.requested_delivery_at, orders.shipping_provider, orders.transaction_reference, orders.tracking_number, orders.created_at, u.username AS buyer, u.first_name AS buyer_first, u.last_name AS buyer_last, u.email AS buyer_email, u.address AS buyer_address, order_shipments.assignment_id, order_shipments.status AS shipping_status, order_shipments.transporter_id, transporter.first_name AS transporter_first, transporter.last_name AS transporter_last, transporter.username AS transporter_username')
             ->inner_join('users u', 'u.id = orders.buyer_id');
+        $query->left_join('order_shipments', "order_shipments.order_id = orders.order_id AND order_shipments.status NOT IN ('rejected','cancelled')");
+        $query->left_join('users transporter', 'transporter.id = order_shipments.transporter_id');
         if ($userId !== null) {
             $query->where('orders.buyer_id', $userId);
         }
@@ -338,39 +348,117 @@ class Platform_model extends Model
 
     public function orders_for_seller($sellerId)
     {
-        $rows = $this->db->raw(
-            'SELECT DISTINCT o.order_id, o.buyer_id, o.total_amount, o.status, o.payment_status,
-                    o.payment_method, o.delivery_address, o.requested_delivery_at,
-                    o.shipping_provider, o.transaction_reference, o.tracking_number, o.paid_at, o.created_at,
-                    u.username AS buyer, u.first_name AS buyer_first, u.last_name AS buyer_last,
-                    u.email AS buyer_email, u.address AS buyer_address
-             FROM orders o
-             INNER JOIN users u ON u.id = o.buyer_id
-             INNER JOIN order_items oi ON oi.order_id = o.order_id
-             WHERE oi.seller_id = ?
-             ORDER BY o.order_id DESC LIMIT 200',
-            [(int) $sellerId]
-        )->fetchAll(PDO::FETCH_ASSOC);
+        $orderIds = $this->db->table('order_items')->select('order_id')
+            ->where('seller_id', $sellerId)->get_all(PDO::FETCH_COLUMN);
+        $orderIds = array_values(array_unique(array_map('intval', $orderIds)));
+        if (!$orderIds) {
+            return [];
+        }
+        $assignmentQuery = $this->db->table('order_shipments')
+            ->select('order_shipments.order_id, order_shipments.assignment_id, order_shipments.status AS shipping_status, order_shipments.transporter_id, transporter.first_name AS transporter_first, transporter.last_name AS transporter_last, transporter.username AS transporter_username')
+            ->left_join('users transporter', 'transporter.id = order_shipments.transporter_id')
+            ->where('order_shipments.status', '<>', 'rejected')
+            ->where('order_shipments.status', '<>', 'cancelled');
+        $this->where_ids($assignmentQuery, 'order_shipments.order_id', $orderIds);
+        $assignments = $assignmentQuery->order_by('order_shipments.assignment_id', 'DESC')->get_all(PDO::FETCH_ASSOC);
+        $assignmentByOrder = [];
+        foreach ($assignments as $assignment) {
+            $assignmentByOrder[(int) $assignment['order_id']] ??= $assignment;
+        }
+        $rows = $this->db->table('orders')
+            ->select('orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.payment_method, orders.delivery_address, orders.requested_delivery_at, orders.shipping_provider, orders.transaction_reference, orders.tracking_number, orders.paid_at, orders.created_at, buyer.username AS buyer, buyer.first_name AS buyer_first, buyer.last_name AS buyer_last, buyer.email AS buyer_email, buyer.address AS buyer_address')
+            ->inner_join('users buyer', 'buyer.id = orders.buyer_id');
+        $this->where_ids($rows, 'orders.order_id', $orderIds);
+        $rows = $rows->order_by('orders.order_id', 'DESC')->limit(200)->get_all(PDO::FETCH_ASSOC);
+        if (!$rows) {
+            return [];
+        }
         foreach ($rows as &$order) {
-            $order['items'] = $this->db->raw(
-                'SELECT oi.item_id, oi.listing_id, oi.seller_id, oi.product_name, oi.catalog_id,
-                        oi.unit_price, oi.subtotal, oi.quantity, oi.unit, oi.selling_unit,
-                        oi.batch_unit, oi.batch_id, oi.batch_code, oi.farm_id, oi.farm_name,
-                        oi.harvest_date, oi.expiration_date, oi.cart_added_at,
-                        l.image_url, p.product_name AS catalog_name,
-                        COALESCE((SELECT SUM(ba.quantity) FROM batch_allocations ba
-                                  WHERE ba.order_item_id = oi.item_id), 0) AS allocated_quantity
-                 FROM order_items oi
-                 LEFT JOIN marketplace_listings l ON l.listing_id = oi.listing_id
-                 LEFT JOIN products p ON p.product_id = oi.catalog_id
-                 WHERE oi.order_id = ? AND oi.seller_id = ?
-                 ORDER BY oi.item_id',
-                [(int) $order['order_id'], (int) $sellerId]
-            )->fetchAll(PDO::FETCH_ASSOC);
+            $order += [
+                'assignment_id' => null,
+                'shipping_status' => null,
+                'transporter_id' => null,
+                'transporter_first' => null,
+                'transporter_last' => null,
+                'transporter_username' => null,
+            ];
+            $assignment = $assignmentByOrder[(int) $order['order_id']] ?? [];
+            $order = array_merge($order, array_diff_key($assignment, ['order_id' => true]));
+        }
+        unset($order);
+        $itemRows = $this->db->table('order_items')
+            ->select('order_items.order_id, order_items.item_id, order_items.listing_id, order_items.seller_id, order_items.product_name, order_items.catalog_id, order_items.unit_price, order_items.subtotal, order_items.quantity, order_items.unit, order_items.selling_unit, order_items.batch_unit, order_items.batch_id, order_items.batch_code, order_items.farm_id, order_items.farm_name, order_items.harvest_date, order_items.expiration_date, order_items.cart_added_at, listings.image_url, products.product_name AS catalog_name, trace_codes.trace_code, trace_codes.qr_url')
+            ->left_join('marketplace_listings listings', 'listings.listing_id = order_items.listing_id')
+            ->left_join('products', 'products.product_id = order_items.catalog_id')
+            ->left_join('trace_codes', 'trace_codes.order_item_id = order_items.item_id')
+            ->where('order_items.seller_id', $sellerId);
+        $this->where_ids($itemRows, 'order_items.order_id', array_column($rows, 'order_id'));
+        $items = $itemRows->order_by('order_items.item_id')->get_all(PDO::FETCH_ASSOC);
+        $itemIds = array_map('intval', array_column($items, 'item_id'));
+        $allocationQuery = $this->db->table('batch_allocations')->select('order_item_id')
+            ->select_sum('quantity', 'allocated_quantity')->group_by('order_item_id');
+        $allocations = $this->where_ids($allocationQuery, 'order_item_id', $itemIds)
+            ->get_all(PDO::FETCH_ASSOC);
+        $allocatedByItem = [];
+        foreach ($allocations as $allocation) {
+            $allocatedByItem[(int) $allocation['order_item_id']] = (float) $allocation['allocated_quantity'];
+        }
+        $itemsByOrder = [];
+        foreach ($items as $item) {
+            $item['allocated_quantity'] = $allocatedByItem[(int) $item['item_id']] ?? 0;
+            $itemsByOrder[(int) $item['order_id']][] = $item;
+        }
+        foreach ($rows as &$order) {
+            $order['items'] = $itemsByOrder[(int) $order['order_id']] ?? [];
         }
         unset($order);
         $this->attach_order_history($rows);
         return $rows;
+    }
+
+    public function orders_for_transporter($transporterId)
+    {
+        $rows = $this->db->table('order_shipments')
+            ->select('order_shipments.assignment_id, order_shipments.status AS shipping_status, order_shipments.origin, order_shipments.destination, order_shipments.vehicle_number AS shipment_vehicle_number, order_shipments.remarks AS shipping_remarks, order_shipments.created_at AS shipment_created_at, orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.payment_method, orders.paid_at, orders.delivery_address, orders.shipping_provider, orders.tracking_number, orders.created_at, buyer.username AS buyer, buyer.first_name AS buyer_first, buyer.last_name AS buyer_last, farmer.first_name AS farmer_first, farmer.last_name AS farmer_last, farmer.username AS farmer_username')
+            ->inner_join('orders', 'orders.order_id = order_shipments.order_id')
+            ->inner_join('users buyer', 'buyer.id = orders.buyer_id')
+            ->inner_join('users farmer', 'farmer.id = order_shipments.farmer_id')
+            ->where('order_shipments.transporter_id', $transporterId)
+            ->where('order_shipments.status', '<>', 'rejected')
+            ->where('order_shipments.status', '<>', 'cancelled')
+            ->order_by('order_shipments.assignment_id', 'DESC')->limit(200)->get_all(PDO::FETCH_ASSOC);
+        if (!$rows) {
+            return [];
+        }
+        $orderIds = array_map('intval', array_column($rows, 'order_id'));
+        $itemQuery = $this->db->table('order_items')
+            ->select('order_items.order_id, order_items.item_id, order_items.listing_id, order_items.seller_id, order_items.product_name, order_items.subtotal, order_items.unit_price, order_items.quantity, order_items.unit, order_items.batch_id, order_items.batch_code, order_items.farm_id, order_items.farm_name, order_items.harvest_date, order_items.expiration_date, listings.image_url, trace_codes.trace_code, trace_codes.qr_url')
+            ->left_join('marketplace_listings listings', 'listings.listing_id = order_items.listing_id')
+            ->left_join('trace_codes', 'trace_codes.order_item_id = order_items.item_id');
+        $items = $this->where_ids($itemQuery, 'order_items.order_id', $orderIds)
+            ->order_by('order_items.item_id')->get_all(PDO::FETCH_ASSOC);
+        $itemsByOrder = [];
+        foreach ($items as $item) {
+            $itemsByOrder[(int) $item['order_id']][] = $item;
+        }
+        foreach ($rows as &$order) {
+            $order['items'] = $itemsByOrder[(int) $order['order_id']] ?? [];
+        }
+        unset($order);
+        $this->attach_order_history($rows);
+        return $rows;
+    }
+
+    private function where_ids($query, $column, array $ids)
+    {
+        if (!$ids) {
+            return $query->where($column, -1);
+        }
+        return $query->grouped(function ($db) use ($column, $ids) {
+            foreach (array_values($ids) as $index => $id) {
+                $index === 0 ? $db->where($column, $id) : $db->or_where($column, $id);
+            }
+        });
     }
 
     private function attach_order_history(array &$orders)
@@ -379,12 +467,10 @@ class Platform_model extends Model
             return;
         }
         $ids = array_map('intval', array_column($orders, 'order_id'));
-        $placeholders = implode(',', array_fill(0, count($ids), '?'));
-        $historyRows = $this->db->raw(
-            "SELECT order_id, status, payment_status, note, created_at
-             FROM order_status_history WHERE order_id IN ({$placeholders}) ORDER BY history_id ASC",
-            $ids
-        )->fetchAll(PDO::FETCH_ASSOC);
+        $historyQuery = $this->db->table('order_status_history')
+            ->select('order_id, status, payment_status, note, created_at, history_id');
+        $historyRows = $this->where_ids($historyQuery, 'order_id', $ids)
+            ->order_by('history_id')->get_all(PDO::FETCH_ASSOC);
         $byOrder = [];
         foreach ($historyRows as $history) {
             $byOrder[(int) $history['order_id']][] = $history;
@@ -416,75 +502,109 @@ class Platform_model extends Model
         $ownReviews = ['count' => 0, 'average_rating' => 0.0];
         $topProducts = [];
         if ($ownListingIds) {
-            $ownReviews = $this->db->raw(
-                'SELECT COUNT(*) AS count, COALESCE(AVG(r.rating), 0) AS average_rating
-                 FROM product_reviews r
-                 INNER JOIN marketplace_listings l ON l.listing_id = r.listing_id
-                 WHERE l.seller_id = ?',
-                [(int) $userId]
-            )->fetch(PDO::FETCH_ASSOC);
-            $topProducts = $this->db->raw(
-                'SELECT l.listing_id, l.product_name, l.category,
-                        COALESCE(AVG(r.rating), 0) AS average_rating, COUNT(r.review_id) AS review_count
-                 FROM marketplace_listings l
-                 LEFT JOIN product_reviews r ON r.listing_id = l.listing_id
-                 WHERE l.seller_id = ?
-                 GROUP BY l.listing_id, l.product_name, l.category
-                 ORDER BY average_rating DESC, review_count DESC, l.listing_id DESC
-                 LIMIT 5',
-                [(int) $userId]
-            )->fetchAll(PDO::FETCH_ASSOC);
+            $ownReviews = $this->db->table('product_reviews')
+                ->select_count('product_reviews.review_id', 'count')
+                ->select_avg('product_reviews.rating', 'average_rating')
+                ->inner_join('marketplace_listings', 'marketplace_listings.listing_id = product_reviews.listing_id')
+                ->where('marketplace_listings.seller_id', $userId)
+                ->get(PDO::FETCH_ASSOC);
+            $topProducts = $this->db->table('marketplace_listings')
+                ->select('marketplace_listings.listing_id, marketplace_listings.product_name, marketplace_listings.category')
+                ->select_avg('product_reviews.rating', 'average_rating')
+                ->select_count('product_reviews.review_id', 'review_count')
+                ->left_join('product_reviews', 'product_reviews.listing_id = marketplace_listings.listing_id')
+                ->where('marketplace_listings.seller_id', $userId)
+                ->group_by(['marketplace_listings.listing_id', 'marketplace_listings.product_name', 'marketplace_listings.category'])
+                ->get_all(PDO::FETCH_ASSOC);
             foreach ($topProducts as &$product) {
-                $product['average_rating'] = (float) $product['average_rating'];
+                $product['average_rating'] = (float) ($product['average_rating'] ?? 0);
                 $product['review_count'] = (int) $product['review_count'];
             }
             unset($product);
+            usort($topProducts, function ($a, $b) {
+                return $b['average_rating'] <=> $a['average_rating']
+                    ?: $b['review_count'] <=> $a['review_count']
+                    ?: $b['listing_id'] <=> $a['listing_id'];
+            });
+            $topProducts = array_slice($topProducts, 0, 5);
         }
-        $salesSummary = $this->db->raw(
-            'SELECT COUNT(DISTINCT o.buyer_id) AS buyer_count,
-                    COALESCE(SUM(oi.quantity), 0) AS units_sold,
-                    COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS revenue,
-                    COUNT(DISTINCT o.order_id) AS paid_orders
-             FROM order_items oi
-             INNER JOIN orders o ON o.order_id = oi.order_id
-             WHERE oi.seller_id = ? AND o.payment_status = ?',
-            [(int) $userId, 'paid']
-        )->fetch(PDO::FETCH_ASSOC);
-        $productBuyers = $this->db->raw(
-            "SELECT oi.listing_id, oi.product_name, o.buyer_id,
-                    CONCAT_WS(CHAR(32), b.first_name, b.last_name) AS buyer_name,
-                    b.username AS buyer_username, SUM(oi.quantity) AS quantity,
-                    COUNT(DISTINCT o.order_id) AS order_count,
-                    SUM(oi.quantity * oi.unit_price) AS revenue,
-                    MAX(o.paid_at) AS last_purchase
-             FROM order_items oi
-             INNER JOIN orders o ON o.order_id = oi.order_id
-             INNER JOIN users b ON b.id = o.buyer_id
-             WHERE oi.seller_id = ? AND o.payment_status = ?
-             GROUP BY oi.listing_id, oi.product_name, o.buyer_id, b.first_name, b.last_name, b.username
-             ORDER BY last_purchase DESC, oi.product_name, buyer_name
-             LIMIT 200",
-            [(int) $userId, 'paid']
-        )->fetchAll(PDO::FETCH_ASSOC);
+        $paidSales = $this->db->table('order_items')
+            ->select('order_items.listing_id, order_items.product_name, order_items.quantity, order_items.unit_price, orders.order_id, orders.buyer_id, orders.paid_at, buyers.first_name AS buyer_first, buyers.last_name AS buyer_last, buyers.username AS buyer_username')
+            ->inner_join('orders', 'orders.order_id = order_items.order_id')
+            ->inner_join('users buyers', 'buyers.id = orders.buyer_id')
+            ->where('order_items.seller_id', $userId)
+            ->where('orders.payment_status', 'paid')
+            ->get_all(PDO::FETCH_ASSOC);
+        $salesSummary = ['buyer_count' => 0, 'units_sold' => 0, 'revenue' => 0, 'paid_orders' => 0];
+        $buyersSeen = [];
+        $ordersSeen = [];
+        $productBuyerTotals = [];
+        $monthlyTotals = [];
+        $monthlyCutoff = date('Y-m-d', strtotime('-11 months'));
+        foreach ($paidSales as $sale) {
+            $buyerId = (int) $sale['buyer_id'];
+            $orderId = (int) $sale['order_id'];
+            $quantity = (float) $sale['quantity'];
+            $revenue = $quantity * (float) $sale['unit_price'];
+            $buyersSeen[$buyerId] = true;
+            $ordersSeen[$orderId] = true;
+            $salesSummary['units_sold'] += $quantity;
+            $salesSummary['revenue'] += $revenue;
+
+            $key = json_encode([(int) ($sale['listing_id'] ?? 0), $sale['product_name'], $buyerId]);
+            if (!isset($productBuyerTotals[$key])) {
+                $productBuyerTotals[$key] = [
+                    'listing_id' => $sale['listing_id'],
+                    'product_name' => $sale['product_name'],
+                    'buyer_id' => $buyerId,
+                    'buyer_name' => trim(($sale['buyer_first'] ?? '') . ' ' . ($sale['buyer_last'] ?? '')),
+                    'buyer_username' => $sale['buyer_username'],
+                    'quantity' => 0,
+                    'order_ids' => [],
+                    'revenue' => 0,
+                    'last_purchase' => null,
+                ];
+            }
+            $productBuyerTotals[$key]['quantity'] += $quantity;
+            $productBuyerTotals[$key]['order_ids'][$orderId] = true;
+            $productBuyerTotals[$key]['revenue'] += $revenue;
+            if ($productBuyerTotals[$key]['last_purchase'] === null || $sale['paid_at'] > $productBuyerTotals[$key]['last_purchase']) {
+                $productBuyerTotals[$key]['last_purchase'] = $sale['paid_at'];
+            }
+
+            if ($sale['paid_at'] >= $monthlyCutoff) {
+                $monthKey = date('Y-m', strtotime($sale['paid_at']));
+                if (!isset($monthlyTotals[$monthKey])) {
+                    $monthlyTotals[$monthKey] = ['month' => $monthKey, 'revenue' => 0, 'units_sold' => 0, 'orders' => []];
+                }
+                $monthlyTotals[$monthKey]['revenue'] += $revenue;
+                $monthlyTotals[$monthKey]['units_sold'] += $quantity;
+                $monthlyTotals[$monthKey]['orders'][$orderId] = true;
+            }
+        }
+        $salesSummary['buyer_count'] = count($buyersSeen);
+        $salesSummary['paid_orders'] = count($ordersSeen);
+        $productBuyers = array_values($productBuyerTotals);
         foreach ($productBuyers as &$buyer) {
-            $buyer['quantity'] = (float) $buyer['quantity'];
-            $buyer['order_count'] = (int) $buyer['order_count'];
-            $buyer['revenue'] = (float) $buyer['revenue'];
+            $buyer['order_count'] = count($buyer['order_ids']);
+            unset($buyer['order_ids']);
         }
         unset($buyer);
-        $monthlySales = $this->db->raw(
-            "SELECT DATE_FORMAT(o.paid_at, '%Y-%m') AS month,
-                    COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS revenue,
-                    COALESCE(SUM(oi.quantity), 0) AS units_sold,
-                    COUNT(DISTINCT o.order_id) AS paid_orders
-             FROM order_items oi
-             INNER JOIN orders o ON o.order_id = oi.order_id
-             WHERE oi.seller_id = ? AND o.payment_status = ?
-               AND o.paid_at >= DATE_SUB(CURDATE(), INTERVAL 11 MONTH)
-             GROUP BY DATE_FORMAT(o.paid_at, '%Y-%m')
-             ORDER BY month",
-            [(int) $userId, 'paid']
-        )->fetchAll(PDO::FETCH_ASSOC);
+        usort($productBuyers, function ($a, $b) {
+            return strcmp((string) $b['last_purchase'], (string) $a['last_purchase'])
+                ?: strcmp((string) $a['product_name'], (string) $b['product_name'])
+                ?: strcmp((string) $a['buyer_name'], (string) $b['buyer_name']);
+        });
+        $productBuyers = array_slice($productBuyers, 0, 200);
+        $monthlySales = array_values($monthlyTotals);
+        foreach ($monthlySales as &$month) {
+            $month['paid_orders'] = count($month['orders']);
+            unset($month['orders']);
+        }
+        unset($month);
+        usort($monthlySales, function ($a, $b) {
+            return strcmp($a['month'], $b['month']);
+        });
         foreach ($monthlySales as &$month) {
             $month['revenue'] = (float) $month['revenue'];
             $month['units_sold'] = (float) $month['units_sold'];

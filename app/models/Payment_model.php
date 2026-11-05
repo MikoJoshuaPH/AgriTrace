@@ -21,7 +21,7 @@ class Payment_model extends Model
     public function order_items($orderId)
     {
         return $this->db->table('order_items')
-            ->select('item_id, listing_id, seller_id, product_name, unit_price, quantity, unit')
+            ->select('item_id, listing_id, seller_id, product_name, unit_price, quantity, unit, batch_id')
             ->where('order_id', $orderId)
             ->order_by('item_id', 'ASC')
             ->get_all(PDO::FETCH_ASSOC);
@@ -130,6 +130,9 @@ class Payment_model extends Model
         foreach ($this->order_items($orderId) as $item) {
             $exists = $this->db->table('trace_codes')->select('trace_id')->where('order_item_id', $item['item_id'])->limit(1)->get(PDO::FETCH_ASSOC);
             if ($exists) {
+                $this->db->table('trace_codes')->where('trace_id', $exists['trace_id'])->update([
+                    'batch_id' => $item['batch_id'] ?: null
+                ]);
                 continue;
             }
             $category = null;
@@ -146,6 +149,7 @@ class Payment_model extends Model
                 'listing_id' => $item['listing_id'],
                 'buyer_id' => $order['buyer_id'],
                 'seller_id' => $item['seller_id'],
+                'batch_id' => $item['batch_id'] ?: null,
                 'product_name' => $item['product_name'],
                 'category' => $category,
                 'quantity' => $item['quantity'],
@@ -214,7 +218,7 @@ class Payment_model extends Model
     public function public_trace($code)
     {
         $row = $this->db->table('trace_codes')
-            ->select('trace_codes.batch_id, trace_codes.trace_code, trace_codes.product_name, trace_codes.category, trace_codes.quantity, trace_codes.unit, trace_codes.unit_price, trace_codes.qr_url, trace_codes.created_at, o.order_id, o.paid_at, o.payment_status, b.first_name AS buyer_first, b.last_name AS buyer_last, b.username AS buyer_username, s.first_name AS farmer_first, s.last_name AS farmer_last, s.username AS farmer_username, s.location_label AS farmer_location, l.location AS listing_location')
+            ->select('trace_codes.batch_id, trace_codes.trace_code, trace_codes.product_name, trace_codes.category, trace_codes.quantity, trace_codes.unit, trace_codes.unit_price, trace_codes.qr_url, trace_codes.created_at, o.order_id, o.status AS order_status, o.paid_at, o.payment_status, b.first_name AS buyer_first, b.last_name AS buyer_last, b.username AS buyer_username, s.first_name AS farmer_first, s.last_name AS farmer_last, s.username AS farmer_username, s.location_label AS farmer_location, l.location AS listing_location')
             ->inner_join('orders o', 'o.order_id = trace_codes.order_id')
             ->inner_join('users b', 'b.id = trace_codes.buyer_id')
             ->inner_join('users s', 's.id = trace_codes.seller_id')
@@ -229,12 +233,14 @@ class Payment_model extends Model
     {
         $batch = $this->db->raw(
             'SELECT pb.batch_id, pb.product_id, pb.farm_id, pb.batch_code, pb.current_status, pb.quantity, pb.unit,
-                    pb.harvest_date, pb.created_at, p.product_name, p.category,
+                    pb.harvest_date, pb.expiration_date, pb.created_at, p.product_name, p.category,
                     f.farm_name, f.farm_address, f.province, f.municipality, f.barangay,
-                    f.latitude, f.longitude, q.qr_image_path
+                    f.latitude, f.longitude, f.farmer_id, u.first_name AS farmer_first,
+                    u.last_name AS farmer_last, u.username AS farmer_username, q.qr_image_path
              FROM product_batches pb
              INNER JOIN products p ON p.product_id = pb.product_id
              INNER JOIN farms f ON f.farm_id = pb.farm_id
+             INNER JOIN users u ON u.id = f.farmer_id
              LEFT JOIN qr_codes q ON q.batch_id = pb.batch_id AND q.is_active = 1
              WHERE pb.batch_code = ?
              LIMIT 1',
@@ -250,12 +256,14 @@ class Payment_model extends Model
     {
         $batch = $this->db->raw(
             'SELECT pb.batch_id, pb.product_id, pb.farm_id, pb.batch_code, pb.current_status, pb.quantity, pb.unit,
-                    pb.harvest_date, pb.created_at, p.product_name, p.category,
+                    pb.harvest_date, pb.expiration_date, pb.created_at, p.product_name, p.category,
                     f.farm_name, f.farm_address, f.province, f.municipality, f.barangay,
-                    f.latitude, f.longitude, q.qr_image_path
+                    f.latitude, f.longitude, f.farmer_id, u.first_name AS farmer_first,
+                    u.last_name AS farmer_last, u.username AS farmer_username, q.qr_image_path
              FROM product_batches pb
              INNER JOIN products p ON p.product_id = pb.product_id
              INNER JOIN farms f ON f.farm_id = pb.farm_id
+             INNER JOIN users u ON u.id = f.farmer_id
              LEFT JOIN qr_codes q ON q.batch_id = pb.batch_id AND q.is_active = 1
              WHERE pb.batch_id = ?
              LIMIT 1',
@@ -276,6 +284,18 @@ class Payment_model extends Model
         }
         $harvestQuery .= ' ORDER BY harvest_date ASC, harvest_id ASC';
         $harvests = $this->db->raw($harvestQuery, [(int) $batch['batch_id']])->fetchAll(PDO::FETCH_ASSOC);
+        if (!$harvests && !empty($batch['harvest_date'])) {
+            $harvests[] = [
+                'harvest_id' => null,
+                'harvest_date' => $batch['harvest_date'],
+                'quantity_harvested' => (float) $batch['quantity'],
+                'quality_grade' => null,
+                'notes' => 'Harvest date and expiration are recorded on the registered product batch.',
+                'approval_status' => 'batch_record',
+                'expiration_date' => $batch['expiration_date'],
+                'created_at' => $batch['created_at'],
+            ];
+        }
 
         $shipments = $this->db->raw(
             'SELECT shipment_id, origin, destination, dispatch_time, delivery_time, shipment_status, remarks, created_at,
@@ -372,8 +392,10 @@ class Payment_model extends Model
         ], static function ($value) {
             return $value !== '';
         });
+        $farmerName = trim(($batch['farmer_first'] ?? '') . ' ' . ($batch['farmer_last'] ?? ''));
         $farmer = [
-            'name' => $batch['farm_name'],
+            'name' => $farmerName ?: ($batch['farmer_username'] ?? 'Registered farmer'),
+            'registered_farm' => $batch['farm_name'],
             'location' => $locationParts ? implode(', ', $locationParts) : 'Location not set',
         ];
         if ($includeInternal) {
@@ -403,6 +425,7 @@ class Payment_model extends Model
                 'quantity' => (float) $batch['quantity'],
                 'unit' => $batch['unit'],
                 'harvest_date' => $batch['harvest_date'],
+                'expiration_date' => $batch['expiration_date'],
                 'created_at' => $batch['created_at'],
             ],
             'harvest' => $harvests,

@@ -343,6 +343,13 @@ class ApiController extends Controller {
 
         $input = $this->api->body();
         $allowedProfileFields = ['username', 'first_name', 'middle_name', 'last_name', 'address', 'email', 'contact_number', 'gender', 'profile_pic', 'location_label'];
+        $transporterFields = ['transport_origin', 'vehicle_number', 'vehicle_type'];
+        if (array_intersect($transporterFields, array_keys($input))) {
+            if (($user['role'] ?? '') !== 'transporter' && ($input['role'] ?? '') !== 'transporter') {
+                $this->api->respond_error('Transport details are only available to transporter accounts.', 403);
+            }
+            $allowedProfileFields = array_merge($allowedProfileFields, $transporterFields);
+        }
         $profileUpdates = [];
 
         foreach ($allowedProfileFields as $field) {
@@ -358,6 +365,10 @@ class ApiController extends Controller {
             }
             if ($field === 'email' && !filter_var($value, FILTER_VALIDATE_EMAIL)) {
                 $this->api->respond_error('Invalid email format.', 422);
+            }
+            $maxTransportLengths = ['transport_origin' => 255, 'vehicle_number' => 50, 'vehicle_type' => 80];
+            if (isset($maxTransportLengths[$field]) && mb_strlen($value) > $maxTransportLengths[$field]) {
+                $this->api->respond_error(ucwords(str_replace('_', ' ', $field)) . ' is too long.', 422);
             }
             $profileUpdates[$field] = $value === '' ? null : $value;
             $user[$field] = $profileUpdates[$field];

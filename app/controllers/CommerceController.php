@@ -29,6 +29,9 @@ class CommerceController extends Controller
         if (($auth['role'] ?? '') === 'farmer' && !$all) {
             $this->api->respond(['data' => $this->platform->orders_for_seller((int) $auth['sub'])]);
         }
+        if (($auth['role'] ?? '') === 'transporter' && !$all) {
+            $this->api->respond(['data' => $this->platform->orders_for_transporter((int) $auth['sub'])]);
+        }
         $this->api->respond(['data' => $this->platform->orders($all ? null : (int) $auth['sub'])]);
     }
 
@@ -424,25 +427,11 @@ class CommerceController extends Controller
         $this->api->respond(['received' => true, 'order_id' => $orderId, 'status' => $status]);
     }
 
-    /** Runs once per order after payment: trace codes, QR images, receipt email and notifications. */
+    /** Runs once per order after payment: trace codes, receipt email and notifications. */
     private function after_payment($orderId)
     {
         $order = $this->payments->order_with_buyer($orderId);
         $traces = $this->payments->ensure_trace_codes($orderId);
-        $cloud = $this->call->library('Cloud_storage');
-        $qr = $this->call->library('QrCoder');
-
-        foreach ($traces as $trace) {
-            try {
-                $traceUrl = rtrim((string) config_item('app_frontend_url'), '/')
-                    . '/trace?code=' . rawurlencode($trace['trace_code']);
-                $png = $qr->png($traceUrl);
-                $stored = $cloud->put('qr/' . $trace['trace_code'] . '.png', $png, 'image/png');
-                $this->payments->set_trace_qr($trace['trace_id'], $stored['url']);
-            } catch (Throwable $e) {
-                $this->platform->audit((int) $order['buyer_id'], 'QR_FAILED', 'Trace', $trace['trace_id'], $e->getMessage());
-            }
-        }
 
         $items = $this->payments->order_items($orderId);
         $byItem = [];
@@ -467,7 +456,7 @@ class CommerceController extends Controller
             }
         }
 
-        $this->platform->notify((int) $order['buyer_id'], 'Payment received', 'Order #' . $orderId . ' is paid. Your trace codes and QR codes are ready.');
+        $this->platform->notify((int) $order['buyer_id'], 'Payment received', 'Order #' . $orderId . ' is paid. The farmer will prepare the order and create its product trace QR code.');
         foreach (array_unique(array_map(fn ($i) => (int) $i['seller_id'], $items)) as $sellerId) {
             $this->platform->notify($sellerId, 'Paid order', 'Order #' . $orderId . ' was paid. Prepare the products for delivery.');
         }

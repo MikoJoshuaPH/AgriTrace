@@ -53,6 +53,7 @@ class TraceController extends Controller
             ],
             'farmer' => [
                 'name' => $history ? $history['farmer']['name'] : $farmer,
+                'registered_farm' => $history ? $history['farmer']['registered_farm'] : null,
                 'location' => $history ? $history['farmer']['location'] : ($t['farmer_location'] ?: $t['listing_location']),
             ],
             'buyer' => ['name' => $buyer],
@@ -61,6 +62,7 @@ class TraceController extends Controller
             'supply_chain' => $history ? $history['supply_chain'] : [],
             'order' => [
                 'order_id' => (int) $t['order_id'],
+                'status' => $t['order_status'],
                 'ordered_at' => $t['created_at'],
                 'paid_at' => $t['paid_at'],
             ],

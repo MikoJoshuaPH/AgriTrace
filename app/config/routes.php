@@ -85,6 +85,10 @@ $router->group(['prefix' => '/api'], function ($router) {
     $router->delete('/posts/{id}', 'SocialController::delete_post');
     $router->get('/orders', 'CommerceController::index');
     $router->get('/orders/{id}/batch-options', 'FulfillmentController::batch_options');
+    $router->get('/orders/{id}/transporters', 'FulfillmentController::nearby_transporters');
+    $router->post('/orders/{id}/shipping', 'FulfillmentController::assign_transporter');
+    $router->post('/orders/{id}/trace-qr', 'FulfillmentController::save_order_trace_qr');
+    $router->put('/transporter/shipments/{id}', 'FulfillmentController::transporter_status');
     $router->get('/orders/{id}/payment-status', 'CommerceController::payment_status');
     $router->post('/orders/{id}/payment', 'CommerceController::start_payment');
     $router->post('/orders/{id}/collect-payment', 'FulfillmentController::collect_payment');

@@ -9,7 +9,7 @@ class User_model extends Model
     public function findById($id)
     {
         return $this->db->table('users')
-            ->select('id, username, first_name, middle_name, last_name, address, email, role, is_verified, is_active, age, gender, contact_number, profile_pic, latitude, longitude, location_label, created_at, updated_at')
+            ->select('id, username, first_name, middle_name, last_name, address, email, role, is_verified, is_active, age, gender, contact_number, profile_pic, latitude, longitude, location_label, transport_origin, vehicle_number, vehicle_type, created_at, updated_at')
             ->where('id', $id)
             ->limit(1)
             ->get(PDO::FETCH_ASSOC);
