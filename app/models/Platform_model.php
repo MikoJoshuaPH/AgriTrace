@@ -481,8 +481,44 @@ class Platform_model extends Model
         unset($order);
     }
 
-    public function analytics($userId)
+    public function analytics($userId, $role = '')
     {
+        if ($role === 'transporter') {
+            $shipmentStatuses = $this->db->table('order_shipments')
+                ->select('status')->select_count('assignment_id', 'count')
+                ->where('transporter_id', $userId)
+                ->where('status', '<>', 'rejected')->where('status', '<>', 'cancelled')
+                ->group_by('status')->get_all(PDO::FETCH_ASSOC);
+            $totalShipments = 0;
+            $activeShipments = 0;
+            $completedShipments = 0;
+            foreach ($shipmentStatuses as &$shipmentStatus) {
+                $shipmentStatus['count'] = (int) $shipmentStatus['count'];
+                $totalShipments += $shipmentStatus['count'];
+                if (in_array($shipmentStatus['status'], ['offered', 'accepted', 'in_transit', 'out_for_delivery'], true)) {
+                    $activeShipments += $shipmentStatus['count'];
+                }
+                if ($shipmentStatus['status'] === 'delivered') {
+                    $completedShipments += $shipmentStatus['count'];
+                }
+            }
+            unset($shipmentStatus);
+            $recentShipments = $this->db->table('order_shipments')
+                ->select('order_shipments.assignment_id, order_shipments.order_id, order_shipments.status, order_shipments.origin, order_shipments.destination, order_shipments.created_at, orders.shipping_provider, buyer.first_name AS buyer_first, buyer.last_name AS buyer_last')
+                ->inner_join('orders', 'orders.order_id = order_shipments.order_id')
+                ->inner_join('users buyer', 'buyer.id = orders.buyer_id')
+                ->where('order_shipments.transporter_id', $userId)
+                ->where('order_shipments.status', '<>', 'rejected')->where('order_shipments.status', '<>', 'cancelled')
+                ->order_by('order_shipments.assignment_id', 'DESC')->limit(50)->get_all(PDO::FETCH_ASSOC);
+            return [
+                'my_shipments' => $totalShipments,
+                'my_active_shipments' => $activeShipments,
+                'my_delivered_shipments' => $completedShipments,
+                'my_shipment_statuses' => $shipmentStatuses,
+                'my_recent_shipments' => $recentShipments
+            ];
+        }
+
         $categories = $this->db->table('marketplace_listings')->select('category')
             ->select_count('category', 'count')->where('is_available', 1)->where('stock', '>', 0)
             ->group_by('category')->order_by('category')->get_all(PDO::FETCH_ASSOC);

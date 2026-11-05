@@ -312,7 +312,7 @@ class SocialController extends Controller
     {
         $this->api->require_method('GET');
         $auth = $this->api->require_jwt();
-        $this->api->respond($this->platform->analytics((int) $auth['sub']));
+        $this->api->respond($this->platform->analytics((int) $auth['sub'], (string) ($auth['role'] ?? '')));
     }
 
     /**
