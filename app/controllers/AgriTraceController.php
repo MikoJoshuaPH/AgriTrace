@@ -146,9 +146,14 @@ class AgriTraceController extends Controller
         if ($resource === 'batches') {
             $harvestDate = trim((string) ($input['harvest_date'] ?? ''));
             $quantity = filter_var($input['quantity'] ?? null, FILTER_VALIDATE_FLOAT);
+            $qualityGrade = trim((string) ($input['quality_grade'] ?? ''));
             if (!$this->isValidDate($harvestDate)) {
                 $this->api->respond_error('A valid harvest date is required when creating a batch.', 422);
             }
+            if ($qualityGrade === '' || mb_strlen($qualityGrade) > 50) {
+                $this->api->respond_error('A harvest quality grade of 1 to 50 characters is required when creating a batch.', 422);
+            }
+            $input['quality_grade'] = $qualityGrade;
             $expirationDate = trim((string) ($input['expiration_date'] ?? ''));
             if ($expirationDate !== '' && (!$this->isValidDate($expirationDate) || $expirationDate < $harvestDate)) {
                 $this->api->respond_error('Expiration date must be a valid date on or after the harvest date.', 422);

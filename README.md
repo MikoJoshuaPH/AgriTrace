@@ -272,6 +272,11 @@ Checkout provides both `payment_method=xendit` and `payment_method=cod`.
 Online payment requires a configured Xendit key; COD remains available
 independently and is paid upon delivery.
 
+Migration `026_order_delivery_coordinates.php` stores the buyer's pinned map
+coordinates on each order. Run the pending backend migrations before using
+checkout delivery maps; coordinates are returned only to the buyer and the
+transporter assigned to that order.
+
 Configure the Xendit invoice callback URL as:
 
 `https://<your-api-host>/api/payments/xendit/webhook`

@@ -85,7 +85,7 @@ class Platform_model extends Model
     public function farmers($viewerId)
     {
         $farmerRows = $this->db->table('users')
-            ->select('users.id, users.username, users.first_name, users.middle_name, users.last_name, users.profile_pic, users.is_verified, farms.farm_id, farms.farm_name, farms.municipality, farms.province')
+            ->select('users.id, users.username, users.first_name, users.middle_name, users.last_name, users.role, users.profile_pic, users.is_verified, farms.farm_id, farms.farm_name, farms.municipality, farms.province')
             ->left_join('farms', 'farms.farmer_id = users.id')
             ->where(['users.role' => 'farmer', 'users.is_active' => 1])
             ->where('users.id', '<>', $viewerId)
@@ -309,7 +309,7 @@ class Platform_model extends Model
     public function orders($userId = null)
     {
         $query = $this->db->table('orders')
-            ->select('orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.payment_method, orders.paid_at, orders.xendit_invoice_url, orders.delivery_address, orders.requested_delivery_at, orders.shipping_provider, orders.transaction_reference, orders.tracking_number, orders.created_at, u.username AS buyer, u.first_name AS buyer_first, u.last_name AS buyer_last, u.email AS buyer_email, u.address AS buyer_address, order_shipments.assignment_id, order_shipments.status AS shipping_status, order_shipments.transporter_id, transporter.first_name AS transporter_first, transporter.last_name AS transporter_last, transporter.username AS transporter_username')
+            ->select('orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.payment_method, orders.paid_at, orders.xendit_invoice_url, orders.delivery_address, orders.delivery_latitude, orders.delivery_longitude, orders.requested_delivery_at, orders.shipping_provider, orders.transaction_reference, orders.tracking_number, orders.created_at, u.username AS buyer, u.first_name AS buyer_first, u.last_name AS buyer_last, u.email AS buyer_email, u.address AS buyer_address, order_shipments.assignment_id, order_shipments.status AS shipping_status, order_shipments.transporter_id, transporter.first_name AS transporter_first, transporter.last_name AS transporter_last, transporter.username AS transporter_username')
             ->inner_join('users u', 'u.id = orders.buyer_id');
         $query->left_join('order_shipments', "order_shipments.order_id = orders.order_id AND order_shipments.status NOT IN ('rejected','cancelled')");
         $query->left_join('users transporter', 'transporter.id = order_shipments.transporter_id');
@@ -419,7 +419,7 @@ class Platform_model extends Model
     public function orders_for_transporter($transporterId)
     {
         $rows = $this->db->table('order_shipments')
-            ->select('order_shipments.assignment_id, order_shipments.status AS shipping_status, order_shipments.origin, order_shipments.destination, order_shipments.vehicle_number AS shipment_vehicle_number, order_shipments.remarks AS shipping_remarks, order_shipments.created_at AS shipment_created_at, orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.payment_method, orders.paid_at, orders.delivery_address, orders.shipping_provider, orders.tracking_number, orders.created_at, buyer.username AS buyer, buyer.first_name AS buyer_first, buyer.last_name AS buyer_last, farmer.first_name AS farmer_first, farmer.last_name AS farmer_last, farmer.username AS farmer_username')
+            ->select('order_shipments.assignment_id, order_shipments.status AS shipping_status, order_shipments.origin, order_shipments.destination, order_shipments.vehicle_number AS shipment_vehicle_number, order_shipments.remarks AS shipping_remarks, order_shipments.created_at AS shipment_created_at, orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.payment_method, orders.paid_at, orders.delivery_address, orders.delivery_latitude, orders.delivery_longitude, orders.shipping_provider, orders.tracking_number, orders.created_at, buyer.username AS buyer, buyer.first_name AS buyer_first, buyer.last_name AS buyer_last, farmer.first_name AS farmer_first, farmer.last_name AS farmer_last, farmer.username AS farmer_username')
             ->inner_join('orders', 'orders.order_id = order_shipments.order_id')
             ->inner_join('users buyer', 'buyer.id = orders.buyer_id')
             ->inner_join('users farmer', 'farmer.id = order_shipments.farmer_id')

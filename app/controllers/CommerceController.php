@@ -184,6 +184,8 @@ class CommerceController extends Controller
         $items = $input['items'] ?? null;
         $checkoutKey = trim((string) ($input['idempotency_key'] ?? ''));
         $deliveryAddress = trim((string) ($input['delivery_address'] ?? ''));
+        $deliveryLatitude = $input['delivery_latitude'] ?? null;
+        $deliveryLongitude = $input['delivery_longitude'] ?? null;
         $xendit = $this->call->library('Xendit');
         $paymentMethod = strtolower(trim((string) ($input['payment_method'] ?? '')));
         if (!in_array($paymentMethod, ['cod', 'xendit'], true)) {
@@ -200,6 +202,18 @@ class CommerceController extends Controller
         }
         if ($deliveryAddress === '' || strlen($deliveryAddress) > 1000) {
             $this->api->respond_error('Enter a delivery address (maximum 1000 characters).', 422);
+        }
+        if (($deliveryLatitude === null) !== ($deliveryLongitude === null)) {
+            $this->api->respond_error('Choose a complete delivery map location.', 422);
+        }
+        if ($deliveryLatitude !== null) {
+            if (!is_numeric($deliveryLatitude) || !is_numeric($deliveryLongitude)
+                || (float) $deliveryLatitude < -90 || (float) $deliveryLatitude > 90
+                || (float) $deliveryLongitude < -180 || (float) $deliveryLongitude > 180) {
+                $this->api->respond_error('Choose a valid delivery map location.', 422);
+            }
+            $deliveryLatitude = (float) $deliveryLatitude;
+            $deliveryLongitude = (float) $deliveryLongitude;
         }
 
         $lines = [];
@@ -321,6 +335,8 @@ class CommerceController extends Controller
                     'seller_id' => $sellerId,
                     'checkout_key' => $checkoutKey,
                     'delivery_address' => $deliveryAddress,
+                    'delivery_latitude' => $deliveryLatitude,
+                    'delivery_longitude' => $deliveryLongitude,
                     'total_amount' => round($sellerTotals[$sellerId], 2),
                     'payment_method' => $paymentMethod,
                     'status' => 'pending',
