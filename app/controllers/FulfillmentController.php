@@ -69,7 +69,7 @@ class FulfillmentController extends Controller
         if (!$order || $order['status'] !== 'ready_for_shipment') {
             $this->api->respond_error('Prepare the order before choosing a transporter.', 409);
         }
-        if ($order['payment_method'] === 'xendit' && $order['payment_status'] !== 'paid') {
+        if (in_array($order['payment_method'], ['xendit', 'paymongo'], true) && $order['payment_status'] !== 'paid') {
             $this->api->respond_error('Verified payment is required before shipping.', 409);
         }
         $farm = $this->db->raw(
@@ -149,7 +149,7 @@ class FulfillmentController extends Controller
         if (!$order || $order['status'] !== 'ready_for_shipment') {
             $this->api->respond_error('Only a prepared order can be assigned for shipping.', 409);
         }
-        if ($order['payment_method'] === 'xendit' && $order['payment_status'] !== 'paid') {
+        if (in_array($order['payment_method'], ['xendit', 'paymongo'], true) && $order['payment_status'] !== 'paid') {
             $this->api->respond_error('Verified payment is required before shipping.', 409);
         }
         $transporter = $this->db->raw(
@@ -183,7 +183,7 @@ class FulfillmentController extends Controller
                 ? $this->order_for_shipping((int) $orderId, (int) $auth['sub'], ($auth['role'] ?? '') === 'admin')
                 : null;
             if (!$currentOrder || $currentOrder['status'] !== 'ready_for_shipment'
-                || ($currentOrder['payment_method'] === 'xendit' && $currentOrder['payment_status'] !== 'paid')) {
+                || (in_array($currentOrder['payment_method'], ['xendit', 'paymongo'], true) && $currentOrder['payment_status'] !== 'paid')) {
                 throw new RuntimeException('The order is no longer ready for shipping.');
             }
             $activeAssignment = $this->db->raw(
@@ -406,7 +406,7 @@ class FulfillmentController extends Controller
         $this->db->transaction();
         try {
             $order = $this->db->raw(
-                'SELECT order_id, buyer_id, status, payment_method, payment_status, xendit_invoice_id
+                'SELECT order_id, buyer_id, status, payment_method, payment_status, xendit_invoice_id, paymongo_payment_link_id
                  FROM orders WHERE order_id = ? FOR UPDATE',
                 [$orderId]
             )->fetch(PDO::FETCH_ASSOC);
@@ -432,6 +432,13 @@ class FulfillmentController extends Controller
                 if ($role !== 'farmer' || !in_array($order['status'], ['pending', 'awaiting_farmer_acceptance'], true)) {
                     throw new RuntimeException('Only the farmer can accept an order awaiting review.');
                 }
+                $paymongoStatus = $this->db->raw(
+                    'SELECT paymongo_account_status FROM users WHERE id = ? LIMIT 1 FOR UPDATE',
+                    [(int) $auth['sub']]
+                )->fetchColumn();
+                if ($paymongoStatus !== 'activated') {
+                    throw new RuntimeException('Finish PayMongo account onboarding in your profile before accepting orders.');
+                }
                 $unallocated = $this->db->raw(
                     'SELECT oi.item_id FROM order_items oi
                      LEFT JOIN batch_allocations ba ON ba.order_item_id = oi.item_id
@@ -443,8 +450,9 @@ class FulfillmentController extends Controller
                 if ($unallocated) {
                     throw new RuntimeException('Reserved batch inventory is missing for an order item.');
                 }
-                $nextStatus = $order['payment_method'] === 'xendit' ? 'awaiting_payment' : 'accepted';
-                $nextPayment = $order['payment_method'] === 'xendit' ? 'awaiting_payment' : 'unpaid';
+                $isOnlinePayment = in_array($order['payment_method'], ['xendit', 'paymongo'], true);
+                $nextStatus = $isOnlinePayment ? 'awaiting_payment' : 'accepted';
+                $nextPayment = $isOnlinePayment ? 'awaiting_payment' : 'unpaid';
                 $this->db->table('orders')->where('order_id', $orderId)->update([
                     'status' => $nextStatus, 'payment_status' => $nextPayment
                 ]);
@@ -452,12 +460,12 @@ class FulfillmentController extends Controller
                 $this->db->commit();
                 $this->platform->notify(
                     (int) $order['buyer_id'],
-                    $order['payment_method'] === 'xendit' ? 'Payment required for Order #' . $orderId : 'Order #' . $orderId . ' accepted',
-                    $order['payment_method'] === 'xendit'
+                    $isOnlinePayment ? 'Payment required for Order #' . $orderId : 'Order #' . $orderId . ' accepted',
+                    $isOnlinePayment
                         ? 'The farmer accepted your order. Complete online payment from My Orders.'
                         : 'The farmer accepted your COD order and will prepare it for delivery.'
                 );
-                $this->api->respond(['message' => $order['payment_method'] === 'xendit'
+                $this->api->respond(['message' => $isOnlinePayment
                     ? 'Order accepted. The buyer can now pay online.'
                     : 'COD order accepted and ready for preparation.']);
             }
@@ -482,14 +490,15 @@ class FulfillmentController extends Controller
             if ($isBuyerCancel && !in_array($order['status'], ['pending', 'awaiting_farmer_acceptance', 'awaiting_payment', 'accepted'], true)) {
                 throw new RuntimeException('This order can no longer be cancelled.');
             }
-            if ($status === 'cancelled' && $order['payment_method'] === 'xendit' && !empty($order['xendit_invoice_id'])) {
+            if ($status === 'cancelled' && in_array($order['payment_method'], ['xendit', 'paymongo'], true)
+                && (!empty($order['xendit_invoice_id']) || !empty($order['paymongo_payment_link_id']))) {
                 throw new RuntimeException('An online payment is already in progress. Wait for the payment result before cancelling.');
             }
             if (in_array($status, ['rejected', 'cancelled'], true)
                 && in_array($order['payment_status'], ['paid', 'refunded'], true)) {
                 throw new RuntimeException('A paid order cannot be cancelled without a verified refund.');
             }
-            if ($order['payment_method'] === 'xendit'
+            if (in_array($order['payment_method'], ['xendit', 'paymongo'], true)
                 && in_array($status, ['preparing', 'ready_for_shipment', 'shipped', 'in_transit', 'out_for_delivery', 'delivered', 'completed'], true)
                 && $order['payment_status'] !== 'paid') {
                 throw new RuntimeException('Online payment must be verified before shipping can proceed.');
@@ -516,7 +525,7 @@ class FulfillmentController extends Controller
                 throw new RuntimeException('Select a shipping provider before marking the order shipped.');
             }
             $updates = ['status' => $status];
-            if ($status === 'cancelled' && $order['payment_method'] === 'xendit'
+            if ($status === 'cancelled' && in_array($order['payment_method'], ['xendit', 'paymongo'], true)
                 && !in_array($order['payment_status'], ['paid', 'refunded'], true)) {
                 $updates['payment_status'] = 'failed';
             }

@@ -233,7 +233,7 @@ class Api
         $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
 
         if (stripos($contentType, 'application/json') !== false) {
-            $raw = $this->read_raw_body();
+            $raw = $this->raw_body();
             if ($raw === '') return [];
 
             $input = json_decode($raw, true, 32);
@@ -247,8 +247,13 @@ class Api
             return $this->sanitize_input($_POST);
         }
 
-        parse_str($this->read_raw_body(), $formData);
+        parse_str($this->raw_body(), $formData);
         return $this->sanitize_input($formData ?? []);
+    }
+
+    public function raw_body()
+    {
+        return $this->read_raw_body();
     }
 
     private function read_raw_body()

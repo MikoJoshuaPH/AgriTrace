@@ -115,6 +115,10 @@ $router->group(['prefix' => '/api'], function ($router) {
     $router->post('/catalog/{id}/aliases', 'CatalogController::alias');
     $router->get('/farmer/payment-settings', 'PaymentSettingsController::index');
     $router->post('/farmer/payment-settings', 'PaymentSettingsController::store');
+    $router->get('/farmer/paymongo-account', 'PaymentSettingsController::paymongo_account');
+    $router->post('/farmer/paymongo-account', 'PaymentSettingsController::create_paymongo_account');
+    $router->post('/farmer/paymongo-account/verification', 'PaymentSettingsController::create_paymongo_verification');
+    $router->post('/farmer/paymongo-account/activate', 'PaymentSettingsController::activate_paymongo_account');
     $router->get('/farmer/payouts', 'PaymentSettingsController::payouts');
     $router->post('/orders/{id}/allocate-batches', 'FulfillmentController::allocate');
     $router->put('/orders/{id}/status', 'FulfillmentController::status');
@@ -131,6 +135,7 @@ $router->group(['prefix' => '/api'], function ($router) {
 
     // Payments, trace codes and QR codes
     $router->post('/payments/xendit/webhook', 'CommerceController::xendit_webhook');
+    $router->post('/payments/paymongo/webhook', 'CommerceController::paymongo_webhook');
     $router->get('/trace/batch/{batch_code}/authorized', 'TraceController::show_batch_authorized');
     $router->get('/trace/batch/{batch_code}', 'TraceController::show_batch');
     $router->get('/trace/{code}', 'TraceController::show');

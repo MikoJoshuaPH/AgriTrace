@@ -435,6 +435,10 @@ $config['mail_report_to']      = getenv('MAIL_REPORT_TO') ?: '';
 $config['xendit_base_url']       = getenv('XENDIT_BASE_URL') ?: 'https://api.xendit.co';
 $config['xendit_secret_key']     = getenv('XENDIT_SECRET_KEY') ?: '';
 $config['xendit_callback_token'] = getenv('XENDIT_CALLBACK_TOKEN') ?: '';
+$config['paymongo_base_url']     = getenv('PAYMONGO_BASE_URL') ?: 'https://api.paymongo.com';
+$config['paymongo_secret_key']   = getenv('PAYMONGO_SECRET_KEY') ?: '';
+$config['paymongo_webhook_secret'] = getenv('PAYMONGO_WEBHOOK_SECRET') ?: '';
+$config['paymongo_livemode']     = filter_var(getenv('PAYMONGO_LIVEMODE') ?: 'false', FILTER_VALIDATE_BOOLEAN);
 
 $config['qrcoder_base_url']    = getenv('QRCODER_BASE_URL') ?: 'https://www.qrcoder.co.uk/api/v4/';
 $config['qrcoder_api_key']     = getenv('QRCODER_API_KEY') ?: '';

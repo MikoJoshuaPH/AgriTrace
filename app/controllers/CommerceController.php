@@ -80,7 +80,7 @@ class CommerceController extends Controller
         $this->api->respond(['sales' => $sales]);
     }
 
-    /** GET /api/orders/{id}/payment-status — reconciles the invoice with Xendit. */
+    /** GET /api/orders/{id}/payment-status — reconciles online payments with the gateway. */
     public function payment_status($id)
     {
         $this->api->require_method('GET');
@@ -97,11 +97,44 @@ class CommerceController extends Controller
         if (($auth['role'] ?? '') !== 'admin' && (int) $order['buyer_id'] !== (int) $auth['sub']) {
             $this->api->respond_error('Unauthorized access.', 403);
         }
-        if (!in_array($order['payment_status'], ['unpaid', 'awaiting_payment', 'payment_processing'], true)
-            || empty($order['xendit_invoice_id'])) {
+        if (!in_array($order['payment_status'], ['unpaid', 'awaiting_payment', 'payment_processing'], true)) {
             $this->api->respond(['payment_status' => $order['payment_status']]);
         }
 
+        if ($order['payment_method'] === 'paymongo' && !empty($order['paymongo_checkout_session_id'])) {
+            if (empty($order['paymongo_account_id'])) {
+                $this->api->respond_error('The farmer PayMongo account is no longer available.', 409);
+            }
+            try {
+                $session = $this->call->library('PayMongo')->get_checkout_session(
+                    $order['paymongo_checkout_session_id'],
+                    $order['paymongo_account_id']
+                );
+                $paid = $this->paymongo_session_is_paid($session, $order);
+            } catch (RuntimeException $e) {
+                $this->api->respond_error('The payment status could not be checked right now. Please refresh your orders shortly.', 502);
+            }
+            if ($paid && $this->payments->mark_paid((int) $orderId)) {
+                $this->after_payment((int) $orderId);
+            }
+            $this->api->respond(['payment_status' => $paid ? 'paid' : 'unpaid']);
+        }
+
+        if ($order['payment_method'] === 'paymongo' && !empty($order['paymongo_payment_link_id'])) {
+            try {
+                $paid = $this->paymongo_link_is_paid($order);
+            } catch (RuntimeException $e) {
+                $this->api->respond_error('The payment status could not be checked right now. Please refresh your orders shortly.', 502);
+            }
+            if ($paid && $this->payments->mark_paid((int) $orderId)) {
+                $this->after_payment((int) $orderId);
+            }
+            $this->api->respond(['payment_status' => $paid ? 'paid' : 'unpaid']);
+        }
+
+        if ($order['payment_method'] !== 'xendit' || empty($order['xendit_invoice_id'])) {
+            $this->api->respond(['payment_status' => $order['payment_status']]);
+        }
         try {
             $invoice = $this->call->library('Xendit')->get_invoice($order['xendit_invoice_id']);
         } catch (RuntimeException $e) {
@@ -142,32 +175,77 @@ class CommerceController extends Controller
         if (!$order || (int) $order['buyer_id'] !== (int) $auth['sub']) {
             $this->api->respond_error('Order not found.', 404);
         }
-        if ($order['payment_method'] !== 'xendit' || $order['status'] !== 'awaiting_payment') {
+        if ($order['payment_method'] === 'xendit' && $order['status'] === 'awaiting_payment') {
+            if (!empty($order['xendit_invoice_url'])) {
+                $this->api->respond(['invoice_url' => $order['xendit_invoice_url']]);
+            }
+            $xendit = $this->call->library('Xendit');
+            if (!$xendit->is_configured()) {
+                $this->api->respond_error('The existing Xendit payment cannot be resumed. Contact the administrator.', 503);
+            }
+            $input = $this->api->body();
+            try {
+                $returnUrl = $this->payment_return_url($input['frontend_origin'] ?? null, (int) $orderId);
+                $invoice = $xendit->create_invoice(
+                    $this->invoice_payload($order, $this->payments->order_items((int) $orderId), $returnUrl)
+                );
+            } catch (RuntimeException $e) {
+                $this->platform->audit((int) $auth['sub'], 'PAYMENT_START_FAILED', 'Order', (int) $orderId, $e->getMessage());
+                $this->api->respond_error('The existing Xendit payment could not be resumed.', 502);
+            }
+            $this->payments->save_invoice((int) $orderId, $invoice['id'], $invoice['invoice_url'], $invoice['external_id']);
+            $this->payments->record_order_event((int) $orderId, 'payment_processing', 'payment_processing', 'Legacy Xendit invoice created.', (int) $auth['sub']);
+            $this->api->respond(['invoice_url' => $invoice['invoice_url'], 'payment_status' => 'payment_processing']);
+        }
+        if ($order['payment_method'] !== 'paymongo' || $order['status'] !== 'awaiting_payment') {
             $this->api->respond_error('Online payment is available after the farmer accepts the order.', 409);
         }
-        if (!empty($order['xendit_invoice_url'])) {
-            $this->api->respond(['invoice_url' => $order['xendit_invoice_url']]);
+        if (!empty($order['paymongo_checkout_url'])) {
+            $this->api->respond(['payment_url' => $order['paymongo_checkout_url']]);
+        }
+        if (!empty($order['paymongo_payment_url'])) {
+            $this->api->respond(['payment_url' => $order['paymongo_payment_url']]);
+        }
+        if (empty($order['paymongo_account_id']) || $order['paymongo_account_status'] !== 'activated') {
+            $this->api->respond_error('The farmer must finish PayMongo account verification before this order can be paid online.', 409);
         }
 
-        $xendit = $this->call->library('Xendit');
-        if (!$xendit->is_configured()) {
+        $paymongo = $this->call->library('PayMongo');
+        if (!$paymongo->is_configured()) {
             $this->api->respond_error('Online payment is not configured. Contact the administrator.', 503);
         }
-        $input = $this->api->body();
+        $amountInCents = (int) round((float) $order['total_amount'] * 100);
+        if ($amountInCents < 100 || $amountInCents > 999999999) {
+            $this->api->respond_error('PayMongo online payments must be between PHP 1.00 and PHP 9,999,999.99.', 422);
+        }
         try {
-            $returnUrl = $this->payment_return_url($input['frontend_origin'] ?? null, (int) $orderId);
-            $invoice = $xendit->create_invoice(
-                $this->invoice_payload($order, $this->payments->order_items((int) $orderId), $returnUrl)
+            $returnUrl = $this->payment_return_url($this->api->body()['frontend_origin'] ?? null, (int) $orderId);
+            $session = $paymongo->create_checkout_session(
+                $this->checkout_session_payload($order, $returnUrl),
+                $order['paymongo_account_id']
             );
+            $attributes = $session['attributes'] ?? [];
+            if (($attributes['livemode'] ?? null) !== $paymongo->is_live_mode()
+                || empty($session['id']) || empty($attributes['checkout_url'])) {
+                throw new RuntimeException('PayMongo returned a Checkout Session for an unexpected mode or an invalid response.');
+            }
         } catch (RuntimeException $e) {
             $this->platform->audit((int) $auth['sub'], 'PAYMENT_START_FAILED', 'Order', (int) $orderId, $e->getMessage());
             $this->api->respond_error('Payment could not be started. Your reserved stock remains held while the order awaits payment.', 502);
         }
 
-        $this->payments->save_invoice((int) $orderId, $invoice['id'], $invoice['invoice_url'], $invoice['external_id']);
-        $this->payments->record_order_event((int) $orderId, 'payment_processing', 'payment_processing', 'Online invoice created.', (int) $auth['sub']);
+        $saved = $this->payments->save_checkout_session(
+            (int) $orderId,
+            $session['id'],
+            $attributes['checkout_url'],
+            (string) ($attributes['reference_number'] ?? ('AGT-ORDER-' . $order['order_id']))
+        );
+        if (!$saved) {
+            $this->api->respond_error('This order is no longer waiting for payment. Refresh your orders.', 409);
+        }
+        $this->payments->record_order_event((int) $orderId, 'payment_processing', 'payment_processing', 'PayMongo linked Checkout Session created.', (int) $auth['sub']);
         $this->platform->audit((int) $auth['sub'], 'START_ONLINE_PAYMENT', 'Order', (int) $orderId);
-        $this->api->respond(['invoice_url' => $invoice['invoice_url'], 'payment_status' => 'payment_processing']);
+        $this->api->respond(['payment_url' => $attributes['checkout_url'], 'payment_status' => 'payment_processing']);
     }
 
     /**
@@ -186,12 +264,12 @@ class CommerceController extends Controller
         $deliveryAddress = trim((string) ($input['delivery_address'] ?? ''));
         $deliveryLatitude = $input['delivery_latitude'] ?? null;
         $deliveryLongitude = $input['delivery_longitude'] ?? null;
-        $xendit = $this->call->library('Xendit');
+        $paymongo = $this->call->library('PayMongo');
         $paymentMethod = strtolower(trim((string) ($input['payment_method'] ?? '')));
-        if (!in_array($paymentMethod, ['cod', 'xendit'], true)) {
+        if (!in_array($paymentMethod, ['cod', 'paymongo'], true)) {
             $this->api->respond_error('Choose Cash on Delivery or Online Payment.', 422);
         }
-        if ($paymentMethod === 'xendit' && !$xendit->is_configured()) {
+        if ($paymentMethod === 'paymongo' && !$paymongo->is_configured()) {
             $this->api->respond_error('Online payment is not configured. Choose Cash on Delivery or contact the administrator.', 503);
         }
         if (!is_array($items) || count($items) === 0 || count($items) > 50) {
@@ -465,6 +543,171 @@ class CommerceController extends Controller
         $this->api->respond(['received' => true, 'order_id' => $orderId, 'status' => $status]);
     }
 
+    /** POST /api/payments/paymongo/webhook — confirms paid links against PayMongo. */
+    public function paymongo_webhook()
+    {
+        $this->api->require_method('POST');
+        $paymongo = $this->call->library('PayMongo');
+        if (!$paymongo->is_configured() || config_item('paymongo_webhook_secret') === '') {
+            $this->api->respond_error('PayMongo webhooks are not configured.', 503);
+        }
+
+        $rawBody = $this->api->raw_body();
+        $payload = json_decode($rawBody, true);
+        if ($rawBody === '' || !is_array($payload)) {
+            $this->api->respond_error('Invalid webhook payload.', 400);
+        }
+        $event = $payload['data']['attributes'] ?? [];
+        $liveMode = $event['livemode'] ?? null;
+        $eventType = $event['type'] ?? '';
+        $testIdentityEvent = !$paymongo->is_live_mode()
+            && $liveMode === true
+            && in_array($eventType, ['account.identity_verification.passed', 'account.identity_verification.failed'], true);
+        if (!is_bool($liveMode) || ($liveMode !== $paymongo->is_live_mode() && !$testIdentityEvent)) {
+            $this->api->respond_error('Webhook mode does not match the configured PayMongo environment.', 401);
+        }
+        $signature = $_SERVER['HTTP_X_PAYMONGO_SIGNATURE'] ?? $_SERVER['HTTP_PAYMONGO_SIGNATURE'] ?? '';
+        if (!$paymongo->webhook_signature_valid($rawBody, $signature, $liveMode)) {
+            $this->api->respond_error('Invalid PayMongo webhook signature.', 401);
+        }
+
+        $eventData = $event['data'] ?? [];
+        if (in_array($eventType, ['merchant.activated', 'merchant.declined'], true)) {
+            $accountId = $eventData['merchant_id'] ?? '';
+            if (!is_string($accountId) || $accountId === '') {
+                $this->api->respond_error('PayMongo account id is missing from the webhook.', 400);
+            }
+            $status = $eventType === 'merchant.activated' ? 'activated' : 'declined';
+            $this->db->raw(
+                'UPDATE users SET paymongo_account_status = ? WHERE paymongo_account_id = ?',
+                [$status, $accountId]
+            );
+            $this->api->respond(['received' => true, 'account_status' => $status]);
+        }
+        if (in_array($eventType, ['account.identity_verification.passed', 'account.identity_verification.failed'], true)) {
+            $accountId = $eventData['account_id'] ?? '';
+            if (!is_string($accountId) || $accountId === '') {
+                $this->api->respond_error('PayMongo account id is missing from the identity webhook.', 400);
+            }
+            $status = $eventType === 'account.identity_verification.passed' ? 'passed' : 'failed';
+            $this->db->raw(
+                'UPDATE users SET paymongo_identity_status = ? WHERE paymongo_account_id = ?',
+                [$status, $accountId]
+            );
+            $this->api->respond(['received' => true, 'identity_status' => $status]);
+        }
+        if ($eventType !== 'link.payment.paid') {
+            $this->api->respond(['received' => true, 'ignored' => true]);
+        }
+
+        $link = $event['data'] ?? ($payload['data']['data'] ?? []);
+        $linkId = $link['id'] ?? ($link['attributes']['id'] ?? '');
+        if (!is_string($linkId) || $linkId === '') {
+            $this->api->respond_error('Payment link id is missing.', 400);
+        }
+        $orderId = $this->payments->order_by_paymongo_link($linkId);
+        if (!$orderId) {
+            $this->api->respond_error('Unknown payment link.', 404);
+        }
+        $order = $this->payments->order_with_buyer($orderId);
+        if (!$order || (string) $order['paymongo_payment_link_id'] !== $linkId) {
+            $this->api->respond_error('Unknown order.', 404);
+        }
+        try {
+            if (!$this->paymongo_link_is_paid($order)) {
+                $this->api->respond_error('PayMongo has not confirmed payment for this link.', 502);
+            }
+            if ($this->payments->mark_paid($orderId)) {
+                $this->after_payment($orderId);
+            }
+        } catch (RuntimeException $e) {
+            $this->api->respond_error('The PayMongo payment could not be verified.', 502);
+        }
+        $this->api->respond(['received' => true, 'order_id' => $orderId, 'status' => 'paid']);
+    }
+
+    private function paymongo_link_is_paid(array $order)
+    {
+        $paymongo = $this->call->library('PayMongo');
+        $payments = $paymongo->get_link_payments($order['paymongo_payment_link_id']);
+        $expectedAmount = (int) round((float) $order['total_amount'] * 100);
+        foreach ($payments as $payment) {
+            if (!is_array($payment)) {
+                continue;
+            }
+            $attributes = $payment['attributes'] ?? $payment;
+            if (!is_array($attributes)) {
+                continue;
+            }
+            $status = strtolower((string) ($payment['status'] ?? $attributes['status'] ?? ''));
+            if ($status !== 'paid') {
+                continue;
+            }
+            $amount = $payment['amount'] ?? $attributes['amount'] ?? null;
+            $currency = $payment['currency'] ?? $attributes['currency'] ?? 'PHP';
+            if ((int) $amount !== $expectedAmount || strtoupper((string) $currency) !== 'PHP') {
+                throw new RuntimeException('PayMongo payment amount does not match the order.');
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private function paymongo_session_is_paid(array $session, array $order)
+    {
+        $attributes = $session['attributes'] ?? [];
+        if ((string) ($session['id'] ?? '') !== (string) $order['paymongo_checkout_session_id']
+            || (string) ($attributes['reference_number'] ?? '') !== (string) $order['payment_external_id']) {
+            throw new RuntimeException('PayMongo Checkout Session does not match the order.');
+        }
+        $expectedAmount = (int) round((float) $order['total_amount'] * 100);
+        $payments = $attributes['payments'] ?? [];
+        if (!is_array($payments)) {
+            throw new RuntimeException('PayMongo returned an invalid Checkout Session payment list.');
+        }
+        foreach ($payments as $payment) {
+            if (!is_array($payment)) {
+                continue;
+            }
+            $paymentAttributes = $payment['attributes'] ?? [];
+            if (!is_array($paymentAttributes)) {
+                continue;
+            }
+            if (strtolower((string) ($paymentAttributes['status'] ?? '')) !== 'paid') {
+                continue;
+            }
+            if ((int) ($paymentAttributes['amount'] ?? 0) !== $expectedAmount
+                || strtoupper((string) ($paymentAttributes['currency'] ?? '')) !== 'PHP') {
+                throw new RuntimeException('PayMongo Checkout Session amount does not match the order.');
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private function checkout_session_payload(array $order, $returnUrl)
+    {
+        $reference = 'AGT-ORDER-' . $order['order_id'];
+        $amount = (int) round((float) $order['total_amount'] * 100);
+        return [
+            'data' => [
+                'attributes' => [
+                    'line_items' => [[
+                        'name' => 'AgriTrace order #' . $order['order_id'],
+                        'amount' => $amount,
+                        'currency' => 'PHP',
+                        'quantity' => 1,
+                    ]],
+                    'payment_method_types' => ['qrph'],
+                    'success_url' => $returnUrl,
+                    'cancel_url' => $returnUrl,
+                    'reference_number' => $reference,
+                    'description' => 'Payment for AgriTrace order #' . $order['order_id'],
+                ],
+            ],
+        ];
+    }
+
     /** Runs once per order after payment: trace codes, receipt email and notifications. */
     private function after_payment($orderId)
     {
@@ -537,6 +780,23 @@ class CommerceController extends Controller
             'customer' => ['given_names' => $name, 'email' => $order['buyer_email']],
             'success_redirect_url' => $returnUrl,
             'failure_redirect_url' => $returnUrl,
+        ];
+    }
+
+    private function payment_link_payload(array $order, array $items)
+    {
+        $amount = (int) round((float) $order['total_amount'] * 100);
+        $reference = 'AGT-ORDER-' . $order['order_id'] . '-' . bin2hex(random_bytes(5));
+        return [
+            'amount' => $amount,
+            'currency' => 'PHP',
+            'description' => 'AgriTrace order #' . $order['order_id'],
+            'remarks' => $reference,
+            'metadata' => [
+                'order_id' => (string) $order['order_id'],
+                'external_id' => $reference,
+            ],
+            'restriction' => ['completed_sessions' => ['limit' => 1]],
         ];
     }
 }
