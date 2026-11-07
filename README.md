@@ -64,32 +64,17 @@ composer install
 
 LavaLust loads Composer's `vendor/autoload.php` automatically. QR code
 generation and payment gateways use the project's own HTTP client and do not
-require additional Composer packages. PayMongo uses linked merchant accounts:
-farmers create and complete onboarding from Profile, and cannot accept orders
-until PayMongo reports the account as activated. Online payments use a hosted
-Checkout Session created with that farmer's `Account-ID`; PayMongo settles the
-transaction to the farmer's linked account. Checkout Sessions currently request
-QR Ph, the default payment-acceptance capability for an activated merchant.
-Other payment methods require PayMongo to provision the relevant capability.
+require additional Composer packages. New online orders use Xendit invoices
+from the configured AgriTrace merchant account; farmers do not need to create
+or activate a linked payment account to accept orders. Orders are charged only
+after the farmer accepts them. Configure the existing `XENDIT_BASE_URL`,
+`XENDIT_SECRET_KEY`, and `XENDIT_CALLBACK_TOKEN` values in `.env`, then set the
+Xendit invoice callback URL to
+`https://<your-api-host>/api/payments/xendit/webhook` and configure the same
+callback token in Xendit's dashboard. The API verifies invoice status directly
+with Xendit before marking an order paid; COD remains available.
 
-Set `PAYMONGO_BASE_URL=https://api.paymongo.com`,
-`PAYMONGO_SECRET_KEY`, `PAYMONGO_WEBHOOK_SECRET`, and
-`PAYMONGO_LIVEMODE=false` for test mode. Run backend migrations after updating
-the code. In PayMongo Developers → Webhooks, point the parent-account webhook
-to `https://<your-api-host>/api/payments/paymongo/webhook` and subscribe to
-`account.identity_verification.passed`,
-`account.identity_verification.failed`, `merchant.activated`, and
-`merchant.declined`. Copy that endpoint's signing secret to
-`PAYMONGO_WEBHOOK_SECRET`. PayMongo delivers child-account payment events to
-the child webhook, not the parent; this integration verifies Checkout Session
-status directly with PayMongo when the buyer refreshes payment status.
-
-PayMongo's test Accounts API accepts test secret keys and simulates create,
-verification, update, and activation responses. Its test account ID is a
-shared mock and is not persisted by PayMongo, so use one farmer account for
-testing at a time. COD remains available, but farmers still need an activated
-PayMongo account before they can accept any order, as required by the order
-workflow. Xendit support is retained only for existing orders and invoices.
+Existing `.env` values are left unchanged by this integration cleanup.
 
 ### Upstash Blob storage
 
@@ -291,30 +276,24 @@ tracking, report history, and the metadata needed to connect listings to farms
 and catalog products.
 
 Migration `019_cod_checkout.php` adds the payment method recorded on each order.
-Checkout provides `payment_method=paymongo` and `payment_method=cod`. Run
-pending migrations, including `027_paymongo_payment_links.php` and
-`028_paymongo_linked_accounts.php`, before testing online checkout. PayMongo
-accounts must be activated and have the desired payment methods enabled.
+Checkout provides `payment_method=xendit` and `payment_method=cod`. Run pending
+backend migrations before testing checkout. Xendit online payments are created
+after farmer acceptance; farmers do not need linked-account approval.
 
 Migration `026_order_delivery_coordinates.php` stores the buyer's pinned map
 coordinates on each order. Run the pending backend migrations before using
 checkout delivery maps; coordinates are returned only to the buyer and the
 transporter assigned to that order.
 
-Configure the parent PayMongo webhook endpoint as:
+Configure Xendit's invoice callback as:
 
-`https://<your-api-host>/api/payments/paymongo/webhook`
+`https://<your-api-host>/api/payments/xendit/webhook`
 
-Subscribe it to `account.identity_verification.passed`,
-`account.identity_verification.failed`, `merchant.activated`, and
-`merchant.declined`. Store this endpoint's webhook signing secret in
-`PAYMONGO_WEBHOOK_SECRET`; the API verifies signatures before changing account
-status. Linked payments are created on the farmer account and verified by
-retrieving the Checkout Session with its `Account-ID` when the buyer returns to
-AgriTrace. Use the test secret key and set `PAYMONGO_LIVEMODE=false` while
-testing. A public HTTPS API URL is required for webhook delivery. Switch to the
-live key, live webhook secret, and `PAYMONGO_LIVEMODE=true` only when ready for
-production. Do not send API keys or webhook secrets in chat or commit them.
+Set the callback token in Xendit's dashboard to the same value as
+`XENDIT_CALLBACK_TOKEN`. The endpoint fetches the invoice from Xendit and
+verifies its external ID before changing payment or order status. A public
+HTTPS API URL is required for webhook delivery. Do not send API keys or
+callback tokens in chat or commit them.
 
 New API surfaces include:
 

@@ -11,9 +11,8 @@ class Payment_model extends Model
     public function order_with_buyer($orderId)
     {
         return $this->db->table('orders')
-            ->select('orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.payment_method, orders.xendit_invoice_id, orders.xendit_invoice_url, orders.paymongo_payment_link_id, orders.paymongo_payment_url, orders.paymongo_checkout_session_id, orders.paymongo_checkout_url, orders.payment_external_id, orders.paid_at, orders.created_at, u.email AS buyer_email, u.first_name AS buyer_first, u.last_name AS buyer_last, u.username AS buyer_username, s.id AS farmer_id, s.paymongo_account_id, s.paymongo_account_status')
+            ->select('orders.order_id, orders.buyer_id, orders.total_amount, orders.status, orders.payment_status, orders.payment_method, orders.xendit_invoice_id, orders.xendit_invoice_url, orders.payment_external_id, orders.paid_at, orders.created_at, u.email AS buyer_email, u.first_name AS buyer_first, u.last_name AS buyer_last, u.username AS buyer_username')
             ->inner_join('users u', 'u.id = orders.buyer_id')
-            ->left_join('users s', 's.id = (SELECT oi.seller_id FROM order_items oi WHERE oi.order_id = orders.order_id ORDER BY oi.item_id LIMIT 1)')
             ->where('orders.order_id', $orderId)
             ->limit(1)
             ->get(PDO::FETCH_ASSOC);
@@ -36,38 +35,12 @@ class Payment_model extends Model
         ]);
     }
 
-    public function save_payment_link($orderId, $linkId, $paymentUrl, $referenceNumber)
-    {
-        $changed = $this->db->raw(
-            "UPDATE orders
-             SET paymongo_payment_link_id = ?, paymongo_payment_url = ?,
-                 payment_external_id = ?, payment_status = 'payment_processing'
-             WHERE order_id = ? AND payment_method = 'paymongo' AND status = 'awaiting_payment'
-               AND paymongo_payment_link_id IS NULL",
-            [$linkId, $paymentUrl, $referenceNumber, (int) $orderId]
-        )->rowCount();
-        return $changed > 0;
-    }
-
-    public function save_checkout_session($orderId, $sessionId, $checkoutUrl, $referenceNumber)
-    {
-        $changed = $this->db->raw(
-            "UPDATE orders
-             SET paymongo_checkout_session_id = ?, paymongo_checkout_url = ?,
-                 payment_external_id = ?, payment_status = 'payment_processing'
-             WHERE order_id = ? AND payment_method = 'paymongo' AND status = 'awaiting_payment'
-               AND paymongo_checkout_session_id IS NULL",
-            [$sessionId, $checkoutUrl, $referenceNumber, (int) $orderId]
-        )->rowCount();
-        return $changed > 0;
-    }
-
     /** Marks an accepted online order as paid only after the gateway verifies it. */
     public function mark_paid($orderId)
     {
         $changed = $this->db->raw(
             "UPDATE orders SET payment_status = 'paid', status = 'accepted', paid_at = ?
-             WHERE order_id = ? AND payment_method IN ('xendit', 'paymongo')
+             WHERE order_id = ? AND payment_method = 'xendit'
                AND status = 'awaiting_payment'
                AND payment_status IN ('unpaid','awaiting_payment','payment_processing')",
             [date('Y-m-d H:i:s'), (int) $orderId]
@@ -483,13 +456,6 @@ class Payment_model extends Model
     public function order_by_invoice($invoiceId)
     {
         $row = $this->db->table('orders')->select('order_id')->where('xendit_invoice_id', $invoiceId)->limit(1)->get(PDO::FETCH_ASSOC);
-        return $row ? (int) $row['order_id'] : null;
-    }
-
-    public function order_by_paymongo_link($linkId)
-    {
-        $row = $this->db->table('orders')->select('order_id')
-            ->where('paymongo_payment_link_id', $linkId)->limit(1)->get(PDO::FETCH_ASSOC);
         return $row ? (int) $row['order_id'] : null;
     }
 
