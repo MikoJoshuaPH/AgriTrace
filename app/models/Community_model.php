@@ -332,7 +332,7 @@ class Community_model extends Model
     {
         $limit = max(1, min((int) $limit, 100));
         $query = $this->db->table('community_posts')
-            ->select('community_posts.post_id, community_posts.author_id, community_posts.content, community_posts.post_type, community_posts.listing_id, community_posts.media_url, community_posts.media_type, community_posts.status, community_posts.created_at, u.username, u.first_name, u.last_name, u.profile_pic, u.role, u.is_verified, l.product_name, l.category, l.price, l.stock, l.unit, l.location, l.image_url, l.is_available, l.batch_id, pb.batch_code, pb.current_status AS batch_status, pb.available_quantity AS batch_stock, pb.quantity AS batch_quantity, pb.expiration_date, pb.unit_price AS batch_price')
+            ->select('community_posts.post_id, community_posts.author_id, community_posts.content, community_posts.post_type, community_posts.listing_id, community_posts.media_url, community_posts.media_type, community_posts.status, community_posts.created_at, u.username, u.first_name, u.last_name, u.profile_pic, u.role, u.is_verified, l.product_name, l.category, l.price, l.stock, l.unit, l.location, l.image_url AS product_image, l.is_available, l.batch_id, pb.batch_code, pb.current_status AS batch_status, pb.available_quantity AS batch_stock, pb.quantity AS batch_quantity, pb.expiration_date, pb.unit_price AS batch_price')
             ->inner_join('users u', 'u.id = community_posts.author_id')
             ->left_join('marketplace_listings l', 'l.listing_id = community_posts.listing_id')
             ->left_join('product_batches pb', 'pb.batch_id = l.batch_id')
