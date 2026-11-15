@@ -25,7 +25,7 @@ class Cloud_storage
     {
         $token = $this->token($bucket);
         if ($token !== '') return 'upstash-public';
-        return $bucket === 'backups' ? 'unconfigured' : 'local';
+        return $bucket === 'backups' || !$this->local_storage_allowed() ? 'unconfigured' : 'local';
     }
 
     /** @return array{path:string,url:string,driver:string} */
@@ -50,6 +50,9 @@ class Cloud_storage
             ];
         }
         if ($bucket === 'backups') throw new RuntimeException('Upstash Blob storage is not configured.');
+        if (!$this->local_storage_allowed()) {
+            throw new RuntimeException('Cloud media storage is not configured. Set UPSTASH_BLOB_TOKEN before uploading in production.');
+        }
 
         $absolute = PUBLIC_DIR . 'uploads/cloud/' . $path;
         if (!is_dir(dirname($absolute)) && !mkdir(dirname($absolute), 0755, true)) {
@@ -76,6 +79,9 @@ class Cloud_storage
             return true;
         }
         if ($bucket === 'backups') throw new RuntimeException('Upstash Blob storage is not configured.');
+        if (!$this->local_storage_allowed()) {
+            throw new RuntimeException('Cloud media storage is not configured. Set UPSTASH_BLOB_TOKEN before managing media in production.');
+        }
         $absolute = PUBLIC_DIR . 'uploads/cloud/' . $path;
         if (is_file($absolute)) {
             unlink($absolute);
@@ -99,6 +105,9 @@ class Cloud_storage
         if ($token === '') {
             if ($bucket === 'backups') {
                 throw new RuntimeException('Upstash Blob storage is not configured.');
+            }
+            if (!$this->local_storage_allowed()) {
+                throw new RuntimeException('Cloud media storage is not configured. Set UPSTASH_BLOB_TOKEN before managing media in production.');
             }
             return $this->list_local($prefix);
         }
@@ -173,6 +182,11 @@ class Cloud_storage
     {
         $this->validate_bucket($bucket);
         return config_item('upstash_blob_media_token');
+    }
+
+    private function local_storage_allowed()
+    {
+        return strtolower(trim((string) config_item('environment'))) !== 'production';
     }
 
     private function validate_bucket($bucket)

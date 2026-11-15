@@ -92,8 +92,12 @@ AWS SDK obtains fresh, short-lived S3 credentials from Upstash for storage calls
 all files in this bucket, including admin documents and database backups, are
 publicly readable to anyone with their URLs. Admin-only API routes control
 uploads and deletion but do not make those public object URLs private. Regular
-public-file uploads retain the local storage fallback when the bucket is not
-configured; admin uploads and backup writes require the bucket.
+public-file uploads retain the local storage fallback only during development.
+Set `APP_ENV=production` and configure `UPSTASH_BLOB_TOKEN` in production;
+media uploads and management fail clearly instead of using non-persistent
+container storage when the token is missing. Existing `/uploads/cloud/...`
+files saved by an earlier local fallback must be uploaded again if they are no
+longer present on disk.
 
 ---
 
